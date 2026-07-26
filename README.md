@@ -7,7 +7,7 @@
 </div>
 
 
-###### Quickstart: [`SmartResume_Colab.ipynb`](notebooks/SmartResume_Colab.ipynb) 
+###### Notebook Quickstart: [`Simple.ipynb`](notebooks/Simple.ipynb)
     
 ## Overview
 
@@ -28,7 +28,7 @@ Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and l
 
 ### Colab Notebooks
 
-1. Open [`SmartResume_Colab.ipynb`](notebooks/SmartResume_Colab.ipynb) in Google Colab.
+1. Open [`Simple.ipynb`](notebooks/Simple.ipynb) in Google Colab.
 2. **Runtime → Run all**.
 3. Upload Resumes to /resumes when prompted.
 4. Download the generated `resume_results.csv`.

@@ -281,11 +281,10 @@ class WindowsResumeProcessor:
 
     def __init__(
         self,
-        model_path: str | None = None,
-        pdf_raw_text: bool = False,
-        force_ocr: bool = False,
-        no_layout_detection: bool = False,
-        page_limit: int | None = None,
+        pdf_raw_text: bool,
+        force_ocr: bool,
+        no_layout_detection: bool,
+        page_limit: int,
     ) -> None:
         ResumeAnalyzer = _load_analyzer_class()
         self.EXTRACT_TYPES = _load_extract_types()
@@ -294,18 +293,11 @@ class WindowsResumeProcessor:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         log_device_info()
 
-        # Apply performance tweaks before initialization (in-memory only, this run only)
+        # Apply performance tweaks before initialization 
         self._config_snapshot: dict | None = None
         self._apply_config_overrides(
             pdf_raw_text, force_ocr, no_layout_detection, page_limit
         )
-
-        if model_path:
-            logger.info(
-                "Note: --model-path is accepted but the model path is "
-                "currently controlled by configs/config.yaml "
-                "(direct_model_name). Update that file to change the model."
-            )
 
         try:
             logger.info("Initialising ResumeAnalyzer (loading model + OCR)…")
@@ -364,11 +356,13 @@ class WindowsResumeProcessor:
         pdf_raw_text: bool,
         force_ocr: bool,
         no_layout_detection: bool,
-        page_limit: int | None,
+        page_limit: int,
     ) -> None:
         """
-        Apply CLI overrides in-memory onto the live config singleton, for this run only.
-        Never touches configs/config.yaml on disk.
+        Apply the resolved CLI values onto the live config singleton, for this run only.
+        These values already default to whatever configs/config.yaml has on disk (see
+        build_parser), so this is a no-op unless a flag was explicitly passed with a
+        value different from what's already configured. Never touches config.yaml itself.
         """
         config = _load_config()
         self._config_snapshot = {
@@ -377,22 +371,30 @@ class WindowsResumeProcessor:
             "page_limit": config.processing.page_limit,
             "layout_detection_enabled": config.layout_detection.enabled,
         }
+        layout_detection_enabled = not no_layout_detection
 
-        if pdf_raw_text:
-            config.processing.use_pdf_raw_text = True
-            logger.info("Config: PDF raw text extraction enabled (OCR disabled) [this run only]")
-
-        if force_ocr:
-            config.processing.use_force_ocr = True
-            logger.info("Config: Force OCR enabled for all pages [this run only]")
-
-        if no_layout_detection:
-            config.layout_detection.enabled = False
-            logger.info("Config: Layout detection disabled [this run only]")
-
-        if page_limit:
-            config.processing.page_limit = page_limit
+        if pdf_raw_text != self._config_snapshot["use_pdf_raw_text"]:
+            logger.info(
+                "Config: PDF raw text extraction %s [this run only]",
+                "enabled" if pdf_raw_text else "disabled",
+            )
+        if force_ocr != self._config_snapshot["use_force_ocr"]:
+            logger.info(
+                "Config: Force OCR %s [this run only]",
+                "enabled" if force_ocr else "disabled",
+            )
+        if layout_detection_enabled != self._config_snapshot["layout_detection_enabled"]:
+            logger.info(
+                "Config: Layout detection %s [this run only]",
+                "enabled" if layout_detection_enabled else "disabled",
+            )
+        if page_limit != self._config_snapshot["page_limit"]:
             logger.info("Config: Page limit set to %d [this run only]", page_limit)
+
+        config.processing.use_pdf_raw_text = pdf_raw_text
+        config.processing.use_force_ocr = force_ocr
+        config.layout_detection.enabled = layout_detection_enabled
+        config.processing.page_limit = page_limit
 
     def _restore_config_overrides(self) -> None:
         """Restore the config singleton to its pre-run values."""
@@ -588,6 +590,8 @@ class WindowsResumeProcessor:
 
 def build_parser() -> argparse.ArgumentParser:
     ''' Terminal parser for flag idetnification'''
+    config = _load_config()
+
     p = argparse.ArgumentParser(
         prog="process_resumes.py",
         description="Resume batch processor - Windows / Qwen3-0.6B",
@@ -617,13 +621,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-json", action="store_true",
                    help="Also write a full JSON file alongside the CSV")
     p.add_argument("--pdf-raw-text", action="store_true",
-                   help="Use raw PDF text extraction (skip OCR). ~2–3× faster for text-only PDFs.")
+                   default=config.processing.use_pdf_raw_text,
+                   help="Use raw PDF text extraction (skip OCR). ~2–3× faster for text-only PDFs. "
+                        f"(default: {config.processing.use_pdf_raw_text}, from config.yaml)")
     p.add_argument("--force-ocr", action="store_true",
-                   help="Force OCR on all pages. Better for garbled/scanned PDFs, slower.")
+                   default=config.processing.use_force_ocr,
+                   help="Force OCR on all pages. Better for garbled/scanned PDFs, slower. "
+                        f"(default: {config.processing.use_force_ocr}, from config.yaml)")
     p.add_argument("--no-layout-detection", action="store_true",
-                   help="Disable YOLO layout detection. Faster, worse on complex layouts.")
+                   default=not config.layout_detection.enabled,
+                   help="Disable YOLO layout detection. Faster, worse on complex layouts. "
+                        f"(default: {not config.layout_detection.enabled}, from config.yaml layout_detection.enabled)")
     p.add_argument("--page-limit", metavar="N", type=int,
-                   help="Process only first N pages per resume. Saves time on long CVs.")
+                   default=config.processing.page_limit,
+                   help="Process only first N pages per resume. Saves time on long CVs. "
+                        f"(default: {config.processing.page_limit}, from config.yaml)")
 
     return p
 
@@ -643,7 +655,6 @@ def main() -> None:
             apply_gpu_memory_limit(args.gpu_memory)
 
         with WindowsResumeProcessor(
-            model_path=args.model_path,
             pdf_raw_text=args.pdf_raw_text,
             force_ocr=args.force_ocr,
             no_layout_detection=args.no_layout_detection,
@@ -665,7 +676,6 @@ def main() -> None:
         apply_gpu_memory_limit(args.gpu_memory)
 
     with WindowsResumeProcessor(
-        model_path=args.model_path,
         pdf_raw_text=args.pdf_raw_text,
         force_ocr=args.force_ocr,
         no_layout_detection=args.no_layout_detection,

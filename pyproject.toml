@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Resume Scraping StarterPack - SmartResume Clone"
-version = "0.1.0"
+version = "0.2.0"
 license = { text = "Apache-2.0" }
 description = "Intelligent Resume Parsing System"
 readme = "README.md"
@@ -24,23 +24,22 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.23",
-    "pillow>=9.5",
-    "opencv-python>=4.7",
-    "pdfplumber>=0.10.0",
-    "pandas>=2.0",
-    "pyyaml>=6.0",
-    "tiktoken>=0.5.1",
-    "openai>=1.30.0",
-    "json-repair>=0.16.0",
-    "easyocr>=1.7.0",
-    "langdetect>=1.0.9",
-    "torch>=2.4.0",
-    "transformers>=4.30.0",
-    "accelerate>=0.20.0",
-    "modelscope>=1.9.0",
-    "requests>=2.25.0",
-    "onnxruntime>=1.17.0",
+    pillow>=9.5
+    opencv-python>=4.7
+    pdfplumber>=0.10.0
+    pandas>=2.0
+    pyyaml>=6.0
+    tiktoken>=0.5.1
+    openai>=1.30.0
+    json-repair>=0.16.0
+    easyocr>=1.7.0
+    langdetect>=1.0.9
+    torch>=2.4.0
+    transformers>=4.30.0
+    accelerate>=0.20.0
+    modelscope>=1.9.0
+    requests>=2.25.0
+    onnxruntime>=1.17.0
 ]
 
 [project.optional-dependencies]
