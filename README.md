@@ -1,9 +1,14 @@
 <div align=center>
-   <h6>Adapted by the Data Club of Notre Dame<h6>
-   <h1>Resume Scraping StarterPack (Alibaba/SmartResume Clone)</h1>
-   <p>Simplified English Version</p>
+    <img width="100" height="100" alt="DataClubLogo" src="https://github.com/user-attachments/assets/602b9792-222f-4d02-9273-0641dedbdba0" />
+   <h1>Resume Scraping StarterPack </h1>
+   <p>Simplified English Version of <i>Alibaba/SmartResume</i><p>
+  <h6>Adapted by the Data Club of Notre Dame<h6>
+  <img alt="Qwen" src="https://img.shields.io/badge/Qwen-6950EF?style=flat&logo=qwen&logoColor=white"/> <img alt="YOLO" src="https://img.shields.io/badge/YOLO-111F68?style=flat&logo=yolo&logoColor=white"> <img alt="Transformers" src="https://img.shields.io/badge/transformers-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=white"/> <img alt="Pytorch" src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white"/> <img alt="NVIDIA" src="https://img.shields.io/badge/cuda-000000.svg?style=flat&logo=NVIDIA&logoColor=green"/> 
 </div>
 
+
+###### Quickstart: [`SmartResume_Colab.ipynb`](notebooks/SmartResume_Colab.ipynb) 
+    
 ## Overview
 
 Bulk resume scraper, transforming .pdf content into .JSON and .CSV files for easier processing.
@@ -19,7 +24,7 @@ Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and l
 - Project wide English translation.
 - .csv file generation.
 
-## Quick start
+## Running
 
 ### Colab Notebooks
 
