@@ -111,26 +111,17 @@ class Config:
     def validate(self) -> list[str]:
         """Validate all configuration sections"""
         errors = []
+        use_direct = hasattr(self, 'use_direct_models') and self.use_direct_models
 
-        # Skip model validation if using direct models
-        if not (hasattr(self, 'use_direct_models') and self.use_direct_models):
+        # model/channels/extract_channels are only relevant to the API path
+        if not use_direct:
             errors.extend(self.model.validate())
-        else:
-            # Only validate non-API related fields for direct models
-            if not self.model.name:
-                errors.append("Model name cannot be empty")
-            if self.model.max_tokens <= 0:
-                errors.append("max_tokens must be greater than 0")
-            if not 0 <= self.model.temperature <= 2:
-                errors.append("temperature must be between 0 and 2")
-            if not 0 <= self.model.top_p <= 1:
-                errors.append("top_p must be between 0 and 1")
 
         errors.extend(self.processing.validate())
         errors.extend(self.ocr.validate())
         errors.extend(self.layout_detection.validate())
 
-        if hasattr(self, 'channels') and self.channels:
+        if not use_direct and hasattr(self, 'channels') and self.channels:
             for channel_name, channel_config in self.channels.items():
                 if not hasattr(channel_config, 'name') or not channel_config.name:
                     errors.append(f"Channel {channel_name} is missing 'name'")
@@ -143,7 +134,7 @@ class Config:
                 if not hasattr(channel_config, 'max_tokens') or channel_config.max_tokens <= 0:
                     errors.append(f"Channel {channel_name} has invalid 'max_tokens'")
 
-        if hasattr(self, 'extract_channels') and self.extract_channels:
+        if not use_direct and hasattr(self, 'extract_channels') and self.extract_channels:
             for extract_type, channel_name in self.extract_channels.__dict__.items():
                 if channel_name and channel_name not in getattr(self, 'channels', {}):
                     errors.append(f"Extract type {extract_type} references non-existent channel {channel_name}")
@@ -160,21 +151,27 @@ class Config:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     yaml_config = yaml.safe_load(f)
 
+                # Direct models skip the OpenAI client entirely, so the extra
+                # OpenAI-specific model fields (name/max_tokens/temperature/top_p/seed)
+                # are irrelevant and shouldn't be required.
+                use_direct_models = yaml_config.get('use_direct_models', False)
+
                 # Update model config
                 if 'model' in yaml_config:
                     model_config = yaml_config['model']
-                    required_fields = ['name', 'api_url', 'api_key', 'max_tokens', 'temperature', 'top_p', 'seed']
-                    missing_fields = []
+                    required_fields = (
+                        ['api_url', 'api_key'] if use_direct_models
+                        else ['name', 'api_url', 'api_key', 'max_tokens', 'temperature', 'top_p', 'seed']
+                    )
+                    missing_fields = [f for f in required_fields if f not in model_config]
 
-                    for field_name in required_fields:
-                        if field_name not in model_config:
-                            missing_fields.append(field_name)
-                        else:
-                            setattr(config.model, field_name, model_config[field_name])
+                    for field_name, value in model_config.items():
+                        if hasattr(config.model, field_name):
+                            setattr(config.model, field_name, value)
 
                     if missing_fields:
                         raise ValueError(f"Model config missing required fields: {', '.join(missing_fields)}")
-                else:
+                elif not use_direct_models:
                     raise ValueError("Configuration file missing required 'model' section")
 
                 # Load channels config
@@ -262,6 +259,8 @@ config = Config()
 # Try to load configuration from file
 try:
     config = Config.from_yaml("configs/config.yaml")
-except Exception:
-    # Silently fall back to defaults
-    pass
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning(
+        "Failed to load configs/config.yaml, using defaults: %s", e
+    )

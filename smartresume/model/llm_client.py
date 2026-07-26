@@ -36,7 +36,7 @@ class LLMClient:
 
         self.default_client = None
         self.channel_clients: Dict[str, OpenAI] = {}
-        if not (self.use_direct_models and self.direct_model and self.direct_tokenizer):
+        if not (self.use_direct_models):
             self.default_client = OpenAI(
                 base_url=config.model.api_url,
                 api_key=config.model.api_key
@@ -297,12 +297,9 @@ class LLMClient:
             A dictionary with extracted fields
         """
         if not self.direct_model or not self.direct_tokenizer:
-            print("Direct model not available, falling back to remote API")
-            return self._extract_info_remote(
-                text_content=text_content,
-                extract_types=extract_types,
-                resume_id=resume_id,
-                use_backup_channel=use_backup_channel
+            raise RuntimeError(
+                "Direct model not loaded and use_direct_models=true — no remote "
+                "fallback is attempted. Check direct_model_name and model files."
             )
 
         def call_direct_llm(prompt_key: str) -> Dict[str, Any]:
@@ -420,8 +417,7 @@ class LLMClient:
         Returns:
             A dictionary with extracted fields.
         """
-        # Check if we should use direct models (highest priority)
-        if self.use_direct_models and self.direct_model and self.direct_tokenizer:
+        if self.use_direct_models:
             return self.extract_info_direct(
                 text_content=text_content,
                 extract_types=extract_types,
@@ -429,7 +425,6 @@ class LLMClient:
                 use_backup_channel=use_backup_channel
             )
 
-        # Fall back to remote API (lowest priority)
         return self._extract_info_remote(
             text_content=text_content,
             extract_types=extract_types,

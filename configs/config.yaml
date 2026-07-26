@@ -1,5 +1,4 @@
-# SmartResume - Resume parsing system configuration file example
-# Please copy this file to config.yaml and fill in your actual configuration
+# SmartResume - Resume parsing system configuration file
 
 # Model configuration (used for default OpenAI client)
 model:
@@ -8,8 +7,8 @@ model:
 
 # Multi-channel configuration
 channels:
-  # Default channel
-  default:
+  # Sample API channel
+  api:
     name: "qwen-turbo"
     api_url: "api-place-holder"
     api_key: "your-api-key-here"
@@ -20,9 +19,9 @@ channels:
 
 # Extraction type channel configuration
 extract_channels:
-  basic_info: "local_qwen"
-  work_experience: "local_qwen"
-  education: "local_qwen"
+  basic_info: "api"
+  work_experience: "api"
+  education: "api"
 
 # Processing configuration
 processing:
