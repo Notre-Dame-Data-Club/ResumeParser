@@ -1,0 +1,2 @@
+# Place resume PDFs to process in this folder.
+# PDFs here are git-ignored (see .gitignore); this file only keeps the folder in the repo.

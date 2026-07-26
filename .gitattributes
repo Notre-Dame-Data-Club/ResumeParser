@@ -1,0 +1,8 @@
+# cmd.exe tracks a byte offset while executing a batch file. With LF-only line
+# endings that offset drifts, and execution jumps into unrelated blocks (steps
+# run out of order, blocks re-run, prompts repeat). Batch files must be CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Keep shell scripts LF so they stay runnable in Docker/WSL.
+*.sh text eol=lf

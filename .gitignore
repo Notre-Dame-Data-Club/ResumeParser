@@ -1,0 +1,31 @@
+# Python Files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Downloaded Models
+models/
+
+# Log files
+logs/
+contents/
+*.log
+resume_results.csv
+resume_result.csv
+
+# Resume Files
+resumes/*
+!resumes/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
