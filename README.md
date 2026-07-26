@@ -11,7 +11,7 @@
     
 ## Overview
 
-Bulk resume scraper, transforming .pdf content into .JSON and .CSV files for easier processing.
+Bulk resume scraper and parser, transforming .pdf content into .JSON and .CSV files for easier processing.
 
 **Includes:**
 Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and local Qwen3 field extraction.
