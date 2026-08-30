@@ -1,6 +1,6 @@
 <div align=center>
     <img width="100" height="100" alt="DataClubLogo" src="https://github.com/user-attachments/assets/602b9792-222f-4d02-9273-0641dedbdba0" />
-   <h1>Resume Scraping StarterPack </h1>
+   <h1>Resume Parser StarterPack </h1>
    <p>Simplified English Version of <i>Alibaba/SmartResume</i><p>
   <h6>Adapted by the Data Club of Notre Dame<h6>
   <img alt="Qwen" src="https://img.shields.io/badge/Qwen-6950EF?style=flat&logo=qwen&logoColor=white"/> <img alt="YOLO" src="https://img.shields.io/badge/YOLO-111F68?style=flat&logo=yolo&logoColor=white"> <img alt="Transformers" src="https://img.shields.io/badge/transformers-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=white"/> <img alt="Pytorch" src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white"/> <img alt="NVIDIA" src="https://img.shields.io/badge/cuda-000000.svg?style=flat&logo=NVIDIA&logoColor=green"/> 
