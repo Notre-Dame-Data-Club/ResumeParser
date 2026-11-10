@@ -7,7 +7,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Resume Scraping StarterPack - SmartResume Clone"
+name = "resume-parser"
 version = "0.2.0"
 license = { text = "Apache-2.0" }
 description = "Intelligent Resume Parsing System"
@@ -23,24 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
-dependencies = [
-    pillow>=9.5
-    opencv-python>=4.7
-    pdfplumber>=0.10.0
-    pandas>=2.0
-    pyyaml>=6.0
-    tiktoken>=0.5.1
-    openai>=1.30.0
-    json-repair>=0.16.0
-    easyocr>=1.7.0
-    langdetect>=1.0.9
-    torch>=2.4.0
-    transformers>=4.30.0
-    accelerate>=0.20.0
-    modelscope>=1.9.0
-    requests>=2.25.0
-    onnxruntime>=1.17.0
-]
+dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 dev = [
@@ -58,6 +41,9 @@ gradio = [
     "gradio>=5.34,<6",
     "gradio-pdf>=0.0.22",
 ]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools]
 package-dir = {"" = "."}

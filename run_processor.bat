@@ -354,13 +354,13 @@ exit /b !RC!
 REM -- 3. Download Models --
 :download_models
 echo.
-echo Downloading models from ModelScope...
+echo Downloading models from Hugging Face...
 echo This may take several minutes depending on internet speed.
 echo.
 
 call :log "download_models: starting (script=%MODELS_SCRIPT%)"
 
-%PYTHON_CMD% "%MODELS_SCRIPT%" --model_type llm --source modelscope
+%PYTHON_CMD% "%MODELS_SCRIPT%" --model_type llm --source huggingface
 set RC=!errorlevel!
 
 if !RC! NEQ 0 (

@@ -46,7 +46,7 @@ direct_model_name: "models/Qwen3-0.6B"
 
 # Model download configuration
 model_download:
-  source: "modelscope"  # modelscope
+  source: "huggingface"  # huggingface
   models_dir:
     llm: "models"       # Path for LLM models
     layout: "models"    # Path for layout detection models

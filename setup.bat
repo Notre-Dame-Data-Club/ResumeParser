@@ -6,7 +6,7 @@ setlocal enabledelayedexpansion
 pushd "%~dp0"
 
 set "LOG_FILE=%CD%\setup.log"
-set "PIP_LOG=%CD%\setup-pip.log"
+set "SETUP_PIP_LOG=%CD%\setup-pip.log"
 set "TMP_OUT=%TEMP%\sr_setup_out.txt"
 set "CUDA_INDEX=https://download.pytorch.org/whl/cu126"
 set TOTAL=4
@@ -84,18 +84,19 @@ python -m pip install --upgrade pip >>"%LOG_FILE%" 2>&1
 if !NEED_TORCH! NEQ 0 (
     echo   Installing torch + torchvision, CUDA 12.6  -  ~2.6 GB, 3-10 min
     echo   ----------------------------------------------------------
-    python -m pip install --force-reinstall --log "%PIP_LOG%" torch torchvision --index-url %CUDA_INDEX%
+    python -m pip install --force-reinstall --log "%SETUP_PIP_LOG%" torch torchvision --index-url %CUDA_INDEX%
     if errorlevel 1 (
-        set "ERR=torch CUDA install failed. See %PIP_LOG%."
+        set "ERR=torch CUDA install failed. See %SETUP_PIP_LOG%."
         goto :die
     )
     echo   ----------------------------------------------------------
 )
 
 echo   Installing project and remaining requirements...
-python -m pip install -e . --log "%PIP_LOG%" >>"%LOG_FILE%" 2>&1
+python -m pip install -e . --log "%SETUP_PIP_LOG%" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 (
-    set "ERR=Dependency install failed. See %PIP_LOG%."
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "Get-Content -LiteralPath '%LOG_FILE%' -Tail 8"
+    set "ERR=Dependency install failed. See %SETUP_PIP_LOG%."
     goto :die
 )
 echo   Done.
@@ -131,7 +132,7 @@ if not exist "scripts\download_models.py" (
     echo [%date% %time%] model download skipped - script missing>>"%LOG_FILE%"
     goto :done
 )
-echo   Downloading from ModelScope; already-downloaded files are reused.
+echo   Downloading from Hugging Face; already-downloaded files are reused.
 echo   ----------------------------------------------------------
 python scripts\download_models.py
 if errorlevel 1 (

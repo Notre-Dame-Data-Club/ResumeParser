@@ -7,9 +7,9 @@ from enum import Enum
 class ModelPath(Enum):
     """Model path configurations for different model sources"""
 
-    # ModelScope repositories
-    SMART_RESUME_ROOT_MODELSCOPE = "Alibaba-EI/SmartResume"
-    YOLOV10_ROOT_MODELSCOPE = "Alibaba-EI/SmartResume"
+    # Hugging Face repositories (https://huggingface.co/Alibaba-EI/SmartResume)
+    SMART_RESUME_ROOT_HF = "Alibaba-EI/SmartResume"
+    YOLOV10_ROOT_HF = "Alibaba-EI/SmartResume"
 
     # Specific model paths
     QWEN3_0_6B = "Qwen3-0.6B"
@@ -29,5 +29,5 @@ class ModelType(Enum):
 
 class ModelSource(Enum):
     """Model download sources"""
-    MODELSCOPE = "modelscope"
+    HUGGINGFACE = "huggingface"
     LOCAL = "local"

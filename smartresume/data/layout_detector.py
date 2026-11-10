@@ -152,7 +152,7 @@ class LayoutDetector:
                     from ..utils.models_download_utils import download_model
                     from ..utils.model_paths import ModelType, ModelSource
                     print("Layout model not found, auto-downloading...")
-                    download_path = download_model(ModelType.LAYOUT, ModelSource.MODELSCOPE, config_path or 'models')
+                    download_path = download_model(ModelType.LAYOUT, ModelSource.HUGGINGFACE, config_path or 'models')
                     model_path = os.path.join(download_path, 'yolov10', 'best.onnx')
 
             except Exception as e:

@@ -5,10 +5,10 @@ import os
 from typing import Optional
 
 try:
-    from modelscope import snapshot_download as ms_snapshot_download
-    MODELSCOPE_AVAILABLE = True
+    from huggingface_hub import snapshot_download as hf_snapshot_download
+    HF_HUB_AVAILABLE = True
 except ImportError:
-    MODELSCOPE_AVAILABLE = False
+    HF_HUB_AVAILABLE = False
 
 
 from .model_paths import ModelPath, ModelType, ModelSource
@@ -16,7 +16,7 @@ from .model_paths import ModelPath, ModelType, ModelSource
 
 def auto_download_and_get_model_path(relative_path: str, model_type: ModelType = ModelType.LLM, save_path: Optional[str] = None) -> str:
 
-    model_source = os.getenv('SMARTRESUME_MODEL_SOURCE', "modelscope")
+    model_source = os.getenv('SMARTRESUME_MODEL_SOURCE', "huggingface")
 
     if model_source == 'local':
         from .config import config
@@ -26,8 +26,8 @@ def auto_download_and_get_model_path(relative_path: str, model_type: ModelType =
         return local_path
 
     repo_mapping = {
-        ModelType.LLM: ModelPath.SMART_RESUME_ROOT_MODELSCOPE.value,
-        ModelType.LAYOUT: ModelPath.YOLOV10_ROOT_MODELSCOPE.value
+        ModelType.LLM: ModelPath.SMART_RESUME_ROOT_HF.value,
+        ModelType.LAYOUT: ModelPath.YOLOV10_ROOT_HF.value
     }
 
     if model_type not in repo_mapping:
@@ -35,9 +35,9 @@ def auto_download_and_get_model_path(relative_path: str, model_type: ModelType =
 
     repo = repo_mapping[model_type]
 
-    if not MODELSCOPE_AVAILABLE:
-        raise ImportError("ModelScope not available. Install with: pip install modelscope")
-    snapshot_download = ms_snapshot_download
+    if not HF_HUB_AVAILABLE:
+        raise ImportError("huggingface_hub not available. Install with: pip install huggingface_hub")
+    snapshot_download = hf_snapshot_download
 
     cache_dir = None
 

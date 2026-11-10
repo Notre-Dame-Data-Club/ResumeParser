@@ -100,7 +100,7 @@ class LLMClient:
                 try:
                     from ..utils.models_download_utils import download_model
                     from ..utils.model_paths import ModelType, ModelSource
-                    download_model(ModelType.LLM, ModelSource.MODELSCOPE, models_dir)
+                    download_model(ModelType.LLM, ModelSource.HUGGINGFACE, models_dir)
                     # Try to find the downloaded model
                     for path in possible_paths:
                         if os.path.exists(path):

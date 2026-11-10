@@ -19,7 +19,7 @@ except ImportError as e:
     sys.exit(1)
 
 
-def download_models(model_type: str = "all", source: str = "modelscope", save_path: str = None):
+def download_models(model_type: str = "all", source: str = "huggingface", save_path: str = None):
     """Download models"""
     print(f"Starting to download {model_type} model from {source}")
     if save_path:
@@ -66,7 +66,7 @@ def main():
 Usage examples:
   python scripts/download_models.py                    # Download all models to models directory
   python scripts/download_models.py --model_type llm   # Download LLM model to models directory
-  python scripts/download_models.py --source modelscope  # Download from ModelScope to models directory
+  python scripts/download_models.py --source huggingface  # Download from Hugging Face to models directory
   python scripts/download_models.py --save_path /path/to/models  # Specify custom save path
         """
     )
@@ -80,9 +80,9 @@ Usage examples:
     
     parser.add_argument(
         '--source',
-        choices=['modelscope', 'huggingface'],
-        default='modelscope',
-        help='Model download source (default: modelscope)'
+        choices=['huggingface'],
+        default='huggingface',
+        help='Model download source (default: huggingface)'
     )
     
     parser.add_argument(

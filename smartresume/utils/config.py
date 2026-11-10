@@ -16,7 +16,7 @@ class ModelConfig:
     temperature: float = 0.0
     top_p: float = 1.0
     seed: int = 0
-    model_source: str = "modelscope"  # modelscope, huggingface, local
+    model_source: str = "huggingface"  # huggingface, local
     local_model_path: str = ""
 
     def validate(self) -> list[str]:
@@ -100,7 +100,7 @@ class Config:
 
         # Model download configuration
         self.model_download = {
-            'source': 'modelscope',  # modelscope
+            'source': 'huggingface',  # huggingface
             'models_dir': {
                 'llm': '',
                 'layout': ''

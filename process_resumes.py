@@ -125,7 +125,7 @@ def _load_schema_module():
             "CSV_SCHEMA",
             "CSV_COLUMNS",
             "LIST_SECTIONS",
-            "MULTI_VALUE_SEPARATOR",
+            "KIND_LIST_JSON",
             "validate_csv_schema",
         )
         if not hasattr(schema, name)
@@ -243,9 +243,38 @@ def csv_columns() -> list[str]:
     '''CSV header order, taken from the schema.'''
     return list(_load_schema_module().CSV_COLUMNS)
 
+def _walk_path(entry: dict, path: tuple) -> object:
+    '''Follow nested keys through an extracted entry; "" if any step is missing.'''
+    value: object = entry
+    for key in path:
+        if not isinstance(value, dict):
+            return ""
+        value = value.get(key, "")
+    return "" if value is None else value
+
+
+def _clean_value(value: object) -> object:
+    '''Strip strings; keep lists/numbers as-is so json.dumps preserves types.'''
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return [_clean_value(v) for v in value]
+    return value
+
+
+def _scalar_cell(value: object) -> str:
+    '''Scalar cell: plain text. A list (e.g. URLs) becomes a ", " joined string.'''
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v).strip() for v in value if str(v).strip())
+    return str(value or "").strip()
+
+
 def flatten_extracted_data(raw: dict) -> dict:
     """
     Flatten pipeline output into a single row. Transforms data to fit 1 resume per row.
+
+    Scalar columns are plain strings. list_json columns are a JSON array with one
+    object per resume entry (see schema.py); written with json.dumps so cells parse.
     """
     schema = _load_schema_module()
     row: dict[str, str] = {}
@@ -258,17 +287,20 @@ def flatten_extracted_data(raw: dict) -> dict:
 
         section = raw.get(col.section)
 
-        if col.section in schema.LIST_SECTIONS:
+        if col.kind == schema.KIND_LIST_JSON:
             entries = section if isinstance(section, list) else []
-            values = [
-                str(entry.get(col.field, "") or "").strip()
+            cell = [
+                {
+                    spec.out_key: _clean_value(_walk_path(entry, spec.path))
+                    for spec in col.fields
+                }
                 for entry in entries
                 if isinstance(entry, dict)
             ]
-            row[col.name] = schema.MULTI_VALUE_SEPARATOR.join(v for v in values if v)
+            row[col.name] = json.dumps(cell, ensure_ascii=False) if cell else ""
         else:
             entry = section if isinstance(section, dict) else {}
-            row[col.name] = str(entry.get(col.field, "") or "").strip()
+            row[col.name] = _scalar_cell(entry.get(col.field, ""))
 
     return row
 

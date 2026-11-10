@@ -245,8 +245,8 @@ class DataProcessor:
             if 'education' in raw_data:
                 processed_data['education'] = self._process_education(raw_data['education'], text_lines)
 
-            if 'gpa' in raw_data or 'honors' in raw_data:
-                processed_data['gpa'] = self._process_gpa_info(raw_data)
+            if 'projects' in raw_data:
+                processed_data['projects'] = self._process_projects(raw_data['projects'], text_lines)
 
             self._validate_fields_in_text(processed_data, text_lines)
 
@@ -329,16 +329,44 @@ class DataProcessor:
             if 'period' in edu:
                 processed_edu['period'] = self._process_time_period(edu['period'])
 
-            if 'gpa' in edu:
-                processed_edu['gpa'] = self._clean_text(edu['gpa'])
-                processed_edu['gpaNum'] = self._extract_gpa_number(edu['gpa'])
+            # Prompt emits "GPA"; keep accepting legacy lowercase "gpa".
+            gpa_key = 'GPA' if 'GPA' in edu else ('gpa' if 'gpa' in edu else None)
+            if gpa_key:
+                processed_edu['GPA'] = self._clean_text(edu[gpa_key])
+                processed_edu['gpaNum'] = self._extract_gpa_number(edu[gpa_key])
 
             for key, value in edu.items():
-                if key not in processed_edu:
+                if key not in processed_edu and key != 'gpa':
                     processed_edu[key] = self._clean_text(value) if isinstance(value, str) else value
 
             processed_list.append(processed_edu)
 
+        return processed_list
+
+    def _process_projects(self, projects: List[Dict[str, Any]], text_lines: List[str]) -> List[Dict[str, Any]]:
+        """Process projects: clean strings, resolve description from its index range."""
+        if not isinstance(projects, list):
+            return []
+        processed_list = []
+        for proj in projects:
+            if not isinstance(proj, dict):
+                continue
+            processed = {
+                key: self._clean_text(value) if isinstance(value, str) else value
+                for key, value in proj.items()
+            }
+            if 'description_refer_index_range' in proj:
+                index_range = proj['description_refer_index_range']
+                valid = (
+                    isinstance(index_range, list) and len(index_range) == 2
+                    and all(isinstance(i, int) for i in index_range)
+                )
+                processed['description'] = self._extract_description_from_range(
+                    index_range, text_lines, processed.get('name', ''), ''
+                ) if valid else ''
+            elif 'description' in proj:
+                processed['description'] = self._clean_description(proj['description'])
+            processed_list.append(processed)
         return processed_list
 
     def _clean_email(self, email: str) -> str:
