@@ -3,13 +3,42 @@
 Data processor
 Responsible for processing and cleaning extracted resume data
 """
+import logging
+import math
 import re
 
+from datetime import date
 from statistics import median
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import tiktoken
 import unicodedata
 from smartresume.utils.config import config
+
+logger = logging.getLogger(__name__)
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_PRESENT_WORDS = ("present", "current", "currently", "now", "ongoing", "today", "in progress",
+                  "至今", "现在", "目前")
+_MONTH_YEAR = re.compile(r"\b([A-Za-z]{3,9})\.?,?\s+'?(\d{4})\b")
+_NUMERIC_MONTH_YEAR = re.compile(r"\b(\d{1,2})\s*[/.\-]\s*(\d{4})\b")
+_YEAR_MONTH = re.compile(r"\b(\d{4})\s*[/.\-年]\s*(\d{1,2})\b")
+_YEAR = re.compile(r"\b(19\d{2}|20\d{2}|21\d{2})\b")
+## Dates later than this many years ahead are loop artefacts ("2040", "2041", ...)
+_MAX_YEARS_AHEAD = 8
+_MIN_YEAR = 1950
+## Share of an entry name's words that must appear in the resume for it to count as real
+_NAME_WORD_COVERAGE = 0.75
+## Values a model writes instead of leaving a field empty
+_PLACEHOLDERS = {"unknown", "n/a", "na", "none", "null", "nil", "not specified", "not provided",
+                 "not available", "not mentioned", "unspecified", "-", "--", "?"}
+_PHONE_SPLIT = re.compile(r"\s*(?:/|,|;|\||\bor\b)\s*", re.IGNORECASE)
+## A string that can be a link (has a dot or slash, no spaces): "LinkedIn" is a label, not a link
+_URL_LIKE = re.compile(r"^(?:https?://)?[^\s/]+\.[^\s]+$|^https?://\S+$", re.IGNORECASE)
+## PDF link annotations above this share of page 1's height count as profile links
+_HEADER_LINK_ZONE = 0.2
 
 
 class DataProcessor:
@@ -206,7 +235,8 @@ class DataProcessor:
             Dict: Final processed result
         """
         try:
-            processed_result = self.process_resume_data(structure_output, text_lines)
+            issues: List[str] = []
+            processed_result = self.process_resume_data(structure_output, text_lines, issues)
 
             pages_info = self._extract_pages_info(processed_data)
             if pages_info:
@@ -214,27 +244,36 @@ class DataProcessor:
 
             processed_result['metadata'] = {
                 'text_lines_count': len(text_lines),
-                'pages_count': len(processed_data)
+                'pages_count': len(processed_data),
+                ## What post-processing removed or blanked, for the CSV "warnings" column
+                'issues': issues,
             }
 
             return processed_result
 
-        except Exception:
+        except Exception as e:
+            logger.error("Post-processing failed, keeping raw model output: %s", e, exc_info=True)
             return structure_output
 
-    def process_resume_data(self, raw_data: Dict[str, Any], text_lines: List[str]) -> Dict[str, Any]:
+    def process_resume_data(self, raw_data: Dict[str, Any], text_lines: List[str],
+                            issues: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Process raw resume data.
 
         Args:
             raw_data: Raw data
             text_lines: Text lines
+            issues: Collects a note for every entry dropped or value blanked
 
         Returns:
             Dict: Processed data
         """
+        if issues is None:
+            issues = []
         try:
             processed_data = {}
+
+            raw_data = self._blank_placeholders(raw_data)
 
             if 'basicInfo' in raw_data:
                 processed_data['basicInfo'] = self._process_basic_info(raw_data['basicInfo'])
@@ -248,11 +287,16 @@ class DataProcessor:
             if 'projects' in raw_data:
                 processed_data['projects'] = self._process_projects(raw_data['projects'], text_lines)
 
-            self._validate_fields_in_text(processed_data, text_lines)
+            self._validate_fields_in_text(processed_data, text_lines, issues)
+            self._dedupe_entries(processed_data, issues)
+            self._resolve_work_project_overlap(processed_data, issues)
+            self._normalize_entry_dates(processed_data, issues)
 
             return processed_data
 
-        except Exception:
+        except Exception as e:
+            logger.error("Processing extracted data failed, keeping raw model output: %s", e, exc_info=True)
+            issues.append(f"post-processing failed: {e}")
             return raw_data
 
     def _process_basic_info(self, basic_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -260,10 +304,13 @@ class DataProcessor:
         processed = {}
 
         if 'name' in basic_info:
-            processed['name'] = self._clean_text(basic_info['name'])
+            processed['name'] = self._clean_person_name(basic_info['name'])
 
         if 'phoneNumber' in basic_info:
-            processed['phoneNumber'] = self._clean_text(basic_info['phoneNumber'])
+            processed['phoneNumber'] = self._clean_phone(basic_info['phoneNumber'])
+
+        if 'URLs' in basic_info:
+            processed['URLs'] = self._clean_urls(basic_info['URLs'])
 
         if 'personalEmail' in basic_info:
             processed['personalEmail'] = self._clean_email(basic_info['personalEmail'])
@@ -282,7 +329,9 @@ class DataProcessor:
         """Process work experience"""
         processed_list = []
 
-        for exp in work_exp:
+        for exp in work_exp if isinstance(work_exp, list) else []:
+            if not isinstance(exp, dict):
+                continue
             processed_exp = {}
 
             if 'companyName' in exp:
@@ -297,7 +346,8 @@ class DataProcessor:
             if 'jobDescription_refer_index_range' in exp:
                 processed_exp['jobDescription_refer_index_range'] = exp['jobDescription_refer_index_range']
                 processed_exp['jobDescription'] = self._extract_description_from_range(
-                    exp['jobDescription_refer_index_range'], text_lines, processed_exp['companyName'], processed_exp["position"]
+                    exp['jobDescription_refer_index_range'], text_lines,
+                    processed_exp.get('companyName', ''), processed_exp.get('position', '')
                 )
             elif 'jobDescription' in exp:
                 processed_exp['jobDescription'] = self._clean_description(exp['jobDescription'])
@@ -314,7 +364,9 @@ class DataProcessor:
         """Process education"""
         processed_list = []
 
-        for edu in education:
+        for edu in education if isinstance(education, list) else []:
+            if not isinstance(edu, dict):
+                continue
             processed_edu = {}
 
             if 'school' in edu:
@@ -476,7 +528,9 @@ class DataProcessor:
         Returns:
             Extracted description text
         """
-        if not index_range or len(index_range) != 2:
+        if not isinstance(index_range, (list, tuple)) or len(index_range) != 2:
+            return ""
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in index_range):
             return ""
 
         start_idx, end_idx = index_range
@@ -536,40 +590,78 @@ class DataProcessor:
 
         return processed_period
 
-    def _normalize_date(self, date_str: str) -> str:
-        """Normalize date format"""
-        if not date_str:
+    def _normalize_date(self, date_str: Any) -> str:
+        """
+        Normalize one date to "YYYY-MM", "YYYY" or "Present".
+
+        Handles "Jun 2024", "June, 2024", "Expected May 2029", "06/2024", "2024-06",
+        "2024年6月", "Summer 2025" (year only) and present markers. Text with no
+        recognisable date is returned unchanged.
+        """
+        if date_str is None:
+            return ""
+        text = str(date_str).strip()
+        if not text:
             return ""
 
-        date_str = str(date_str).strip()
+        lowered = text.lower()
+        if any(re.search(rf"\b{re.escape(w)}\b", lowered) if w.isascii() else w in lowered
+               for w in _PRESENT_WORDS) and not _YEAR.search(text):
+            return "Present"
 
-        # Handle "to present" and similar markers
-        if date_str in ['至今', '现在', '目前', 'present', 'now']:
-            return 'present'
+        for match in _MONTH_YEAR.finditer(text):
+            word = match.group(1).lower()
+            month = _MONTHS.get(word[:4]) if word.startswith("sept") else _MONTHS.get(word[:3])
+            if month:
+                return f"{match.group(2)}-{month:02d}"
 
-        date_patterns = [
-            r'(\d{4})[年.-](\d{1,2})[月.-]?(\d{1,2})?',
-            r'(\d{4})[年.-](\d{1,2})',
-            r'(\d{4})',
-        ]
+        match = _YEAR_MONTH.search(text)
+        if match and 1 <= int(match.group(2)) <= 12:
+            return f"{match.group(1)}-{int(match.group(2)):02d}"
 
-        for pattern in date_patterns:
-            match = re.search(pattern, date_str)
-            if match:
-                year = match.group(1)
-                month = match.group(2) if len(match.groups()) > 1 else None
-                day = match.group(3) if len(match.groups()) > 2 else None
+        match = _NUMERIC_MONTH_YEAR.search(text)
+        if match and 1 <= int(match.group(1)) <= 12:
+            return f"{match.group(2)}-{int(match.group(1)):02d}"
 
-                if month:
-                    month = month.zfill(2)
-                    if day:
-                        return f"{year}.{month}.{day.zfill(2)}"
-                    else:
-                        return f"{year}.{month}"
-                else:
-                    return year
+        match = _YEAR.search(text)
+        if match:
+            return match.group(1)
 
-        return date_str
+        return text
+
+    @staticmethod
+    def _date_year(value: str) -> Optional[int]:
+        match = re.match(r"^(\d{4})", value or "")
+        return int(match.group(1)) if match else None
+
+    def _normalize_entry_dates(self, processed_data: Dict[str, Any], issues: List[str]) -> None:
+        """
+        Normalize startDate/endDate in every list section and blank impossible years.
+
+        A range written into one field ("Jun 2024 - Aug 2024" as startDate) is split.
+        """
+        max_year = date.today().year + _MAX_YEARS_AHEAD
+        for section in ('workExperience', 'education', 'projects'):
+            for entry in processed_data.get(section) or []:
+                if not isinstance(entry, dict):
+                    continue
+                start = str(entry.get('startDate') or '')
+                end = str(entry.get('endDate') or '')
+                if start and not end:
+                    parts = re.split(r"\s*(?:\s-\s|–|—|\sto\s)\s*", start, maxsplit=1)
+                    if len(parts) == 2:
+                        start, end = parts
+                    elif self._normalize_date(start) == "Present":
+                        start, end = "", start  # "(Current)" written as the start date
+                for key, raw in (('startDate', start), ('endDate', end)):
+                    if key not in entry and not raw:
+                        continue
+                    value = self._normalize_date(raw)
+                    year = self._date_year(value)
+                    if year is not None and not (_MIN_YEAR <= year <= max_year):
+                        issues.append(f"{section}: blanked implausible {key} '{raw}'")
+                        value = ""
+                    entry[key] = value
 
     def _extract_pages_info(self, processed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Extract page metadata from processed data"""
@@ -615,43 +707,247 @@ class DataProcessor:
         """
         return unicodedata.normalize('NFKC', text).strip()
 
-    def _validate_fields_in_text(self, processed_data: Dict[str, Any], text_lines: List[str]) -> None:
+    def _appears_in_text(self, value: str, normalized_full_text: str, text_words: set) -> bool:
         """
-        Validate that key fields appear in the original text; remove otherwise.
+        True when value is in the resume: verbatim (ignoring case, spaces and
+        punctuation), or with at least 75% of its words present ("Univ. of Notre
+        Dame" vs "University of Notre Dame" still passes; "Lakeview Robotics Club"
+        does not).
+        """
+        normalized = self._normalize_for_comparison(value)
+        if not normalized:
+            return False
+        if normalized in normalized_full_text:
+            return True
+        words = [w for w in re.findall(r"\w+", unicodedata.normalize('NFKC', value).lower()) if len(w) >= 2]
+        if not words:
+            return False
+        found = sum(1 for w in words if w in text_words)
+        return found >= max(1, math.ceil(len(words) * _NAME_WORD_COVERAGE))
 
-        Args:
-            processed_data: Processed data
-            text_lines: Original text lines
+    def _validate_fields_in_text(self, processed_data: Dict[str, Any], text_lines: List[str],
+                                 issues: Optional[List[str]] = None) -> None:
         """
-        full_text = ''.join(text_lines)
+        Drop entries whose name is not in the resume (copied from the prompt's
+        example or invented).
+
+        The entry's identifying field must appear in the text: the company for a job
+        (the position only when there is no company - a common title like "President"
+        would otherwise vouch for an invented club), the school for education (the
+        major only when there is no school) and the name for a project.
+        """
+        if issues is None:
+            issues = []
+        full_text = '\n'.join(text_lines)
         normalized_full_text = self._normalize_for_comparison(full_text)
+        text_words = set(re.findall(r"\w+", unicodedata.normalize('NFKC', full_text).lower()))
 
-        if 'workExperience' in processed_data:
-            valid_works = []
-            for work in processed_data['workExperience']:
-                company_name = work.get('companyName', '').strip()
-                position = work.get('position', '').strip()
+        checks = (
+            ('workExperience', 'companyName', 'position'),
+            ('education', 'school', 'major'),
+            ('projects', 'name', None),
+        )
+        for section, primary, fallback in checks:
+            if section not in processed_data:
+                continue
+            kept = []
+            for entry in processed_data[section]:
+                main_value = str(entry.get(primary) or '').strip()
+                backup_value = str(entry.get(fallback) or '').strip() if fallback else ''
+                if main_value:
+                    valid = self._appears_in_text(main_value, normalized_full_text, text_words)
+                    label = main_value
+                else:
+                    valid = bool(backup_value) and self._appears_in_text(
+                        backup_value, normalized_full_text, text_words)
+                    label = backup_value or '(empty entry)'
+                if valid:
+                    kept.append(entry)
+                else:
+                    issues.append(f"{section}: dropped '{label}' (not found in resume)")
+            processed_data[section] = kept
 
-                normalized_company_name = self._normalize_for_comparison(company_name)
-                normalized_position = self._normalize_for_comparison(position)
+    def _entry_identity(self, section: str, entry: Dict[str, Any]) -> Tuple[str, ...]:
+        """What makes two entries the same, ignoring dates (a loop often only changes those)."""
+        fields = {
+            'workExperience': ('companyName', 'position'),
+            'education': ('school', 'degreeLevel', 'major'),
+            'projects': ('name',),
+        }[section]
+        return tuple(self._normalize_for_comparison(str(entry.get(f) or '')) for f in fields)
 
-                if ((normalized_company_name and normalized_company_name in normalized_full_text) or
-                        (normalized_position and normalized_position in normalized_full_text)):
-                    valid_works.append(work)
+    _DESCRIPTION_FIELDS = {
+        'workExperience': ('jobDescription', 'jobDescription_refer_index_range'),
+        'projects': ('description', 'description_refer_index_range'),
+        'education': ('educationDescription', None),
+    }
 
-            processed_data['workExperience'] = valid_works
+    def _merge_into(self, section: str, kept: Dict[str, Any], dup: Dict[str, Any]) -> None:
+        """
+        Fold a duplicate into the entry kept: a model sometimes writes one job as
+        several entries, one per group of bullets, so their descriptions and
+        technologies belong together.
+        """
+        text_key, range_key = self._DESCRIPTION_FIELDS[section]
+        kept_text, dup_text = str(kept.get(text_key) or ''), str(dup.get(text_key) or '')
+        if dup_text and dup_text not in kept_text:
+            kept[text_key] = f"{kept_text}\n{dup_text}" if kept_text else dup_text
+        if range_key:
+            ranges = [r for r in (kept.get(range_key), dup.get(range_key))
+                      if isinstance(r, list) and len(r) == 2 and all(isinstance(i, int) for i in r)]
+            if ranges:
+                kept[range_key] = [min(r[0] for r in ranges), max(r[1] for r in ranges)]
+        techs = list(kept.get('technologies') or [])
+        for tech in dup.get('technologies') or []:
+            if tech not in techs:
+                techs.append(tech)
+        if 'technologies' in kept or techs:
+            kept['technologies'] = techs
+        for key, value in dup.items():
+            if value not in ('', [], None) and kept.get(key) in ('', [], None):
+                kept[key] = value
 
-        if 'education' in processed_data:
-            valid_educations = []
-            for edu in processed_data['education']:
-                school = edu.get('school', '').strip()
-                major = edu.get('major', '').strip()
+    def _dedupe_entries(self, processed_data: Dict[str, Any], issues: List[str]) -> None:
+        """Merge entries that are identical apart from their dates and descriptions."""
+        for section in ('workExperience', 'education', 'projects'):
+            entries = processed_data.get(section)
+            if not entries:
+                continue
+            first: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+            kept, merged = [], 0
+            for entry in entries:
+                identity = self._entry_identity(section, entry)
+                if any(identity) and identity in first:
+                    self._merge_into(section, first[identity], entry)
+                    merged += 1
+                    continue
+                first[identity] = entry
+                kept.append(entry)
+            if merged:
+                issues.append(f"{section}: merged {merged} duplicate entr{'y' if merged == 1 else 'ies'}")
+            processed_data[section] = kept
 
-                normalized_school = self._normalize_for_comparison(school)
-                normalized_major = self._normalize_for_comparison(major)
+    def _resolve_work_project_overlap(self, processed_data: Dict[str, Any], issues: List[str]) -> None:
+        """
+        One item extracted as both a job and a project (a mixed "EXPERIENCE & PROJECTS"
+        section is read by both prompts) is kept once: as a project when the job's
+        position calls it a project ("Academic Project"), otherwise as a job.
+        """
+        works = processed_data.get('workExperience') or []
+        projects = processed_data.get('projects') or []
+        if not works or not projects:
+            return
 
-                if ((normalized_school and normalized_school in normalized_full_text) or
-                        (normalized_major and normalized_major in normalized_full_text)):
-                    valid_educations.append(edu)
+        drop_work, drop_project = set(), set()
+        for p_idx, project in enumerate(projects):
+            name = self._normalize_for_comparison(str(project.get('name') or ''))
+            if not name:
+                continue
+            for w_idx, work in enumerate(works):
+                company = self._normalize_for_comparison(str(work.get('companyName') or ''))
+                position = self._normalize_for_comparison(str(work.get('position') or ''))
+                ## Exact matches only: "<Club> Data Project" is a real project of <Club>
+                if name not in {company, position, company + position, position + company} - {""}:
+                    continue
+                if 'project' in position:
+                    drop_work.add(w_idx)
+                else:
+                    drop_project.add(p_idx)
+                break
 
-            processed_data['education'] = valid_educations
+        for idx in sorted(drop_work):
+            issues.append(f"workExperience: moved '{works[idx].get('companyName', '')}' to projects only")
+        for idx in sorted(drop_project):
+            issues.append(f"projects: dropped '{projects[idx].get('name', '')}' (already a job)")
+        processed_data['workExperience'] = [w for i, w in enumerate(works) if i not in drop_work]
+        processed_data['projects'] = [p for i, p in enumerate(projects) if i not in drop_project]
+
+    # -- basicInfo cleaners -- #
+    def _clean_person_name(self, name: Any) -> str:
+        """Collapse spaces; an ALL CAPS name becomes Title Case ("BENJAMIN D. KIM" -> "Benjamin D. Kim")."""
+        name = self._clean_text(name)
+        letters = [ch for ch in name if ch.isalpha()]
+        if letters and all(ch.isupper() for ch in letters):
+            name = re.sub(r"[^\W\d_]+", lambda m: m.group(0).capitalize(), name.lower())
+        return name
+
+    def _clean_phone(self, phone: Any) -> str:
+        """
+        Digits only, with a leading "+" for numbers that carry a country code
+        ("1-(779)-875-4805" -> "+17798754805", "(908) 873-7124" -> "9088737124").
+        Several numbers ("+44 7565 009271 / +1 (574) 400-3972") are kept apart,
+        joined with ", ". Text without 7+ digits is returned cleaned but unchanged.
+        """
+        text = self._clean_text(phone)
+        numbers = []
+        for part in _PHONE_SPLIT.split(text):
+            digits = re.sub(r"\D", "", part)
+            if len(digits) < 7:
+                continue
+            numbers.append("+" + digits if part.strip().startswith("+") or len(digits) > 10 else digits)
+        return ", ".join(dict.fromkeys(numbers)) if numbers else text
+
+    @staticmethod
+    def _url_key(url: str) -> str:
+        return re.sub(r"^(?:https?://)?(?:www\.)?", "", url.strip().lower()).rstrip("/")
+
+    @classmethod
+    def _clean_urls(cls, urls: Any) -> List[str]:
+        """
+        Strip and de-duplicate links (ignoring scheme, "www." and a trailing "/").
+        Link labels ("LinkedIn", "GitHub") are dropped: the PDF text often shows
+        only the label, and the address comes from the PDF's link annotations.
+        """
+        if isinstance(urls, str):
+            urls = [u for u in re.split(r"[,\s]+", urls) if u]
+        if not isinstance(urls, list):
+            return []
+        seen, kept = set(), []
+        for url in urls:
+            url = str(url).strip()
+            key = cls._url_key(url)
+            if url and _URL_LIKE.match(url) and key not in seen:
+                seen.add(key)
+                kept.append(url)
+        return kept
+
+    def merge_pdf_links(self, result: Dict[str, Any], pdf_path: str) -> None:
+        """
+        Add the profile links of a PDF (link annotations in the top of page 1, e.g.
+        a "LinkedIn" label linking to the real profile) to basicInfo.URLs. A link
+        the model wrote is replaced by the PDF's full address for the same page.
+        """
+        basic = result.get('basicInfo')
+        if not isinstance(basic, dict) or not str(pdf_path).lower().endswith('.pdf'):
+            return
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                if not pdf.pages:
+                    return
+                page = pdf.pages[0]
+                limit = float(page.height) * _HEADER_LINK_ZONE
+                links = [str(h.get('uri') or '').strip() for h in page.hyperlinks
+                         if float(h.get('top', page.height)) <= limit]
+        except Exception as e:
+            logger.warning("Could not read PDF links from %s: %s", pdf_path, e)
+            return
+        links = [u for u in links if u.lower().startswith(('http://', 'https://'))]
+        if not links:
+            return
+        merged = self._clean_urls(links)
+        keys = {self._url_key(u) for u in merged}
+        merged += [u for u in self._clean_urls(basic.get('URLs') or []) if self._url_key(u) not in keys]
+        basic['URLs'] = merged
+
+    @classmethod
+    def _blank_placeholders(cls, value: Any) -> Any:
+        """Turn "Unknown", "N/A", ... into "" (and drop them from lists)."""
+        if isinstance(value, str):
+            return "" if value.strip().lower() in _PLACEHOLDERS else value
+        if isinstance(value, dict):
+            return {key: cls._blank_placeholders(item) for key, item in value.items()}
+        if isinstance(value, list):
+            cleaned = [cls._blank_placeholders(item) for item in value]
+            return [item for item in cleaned if item != ""]
+        return value

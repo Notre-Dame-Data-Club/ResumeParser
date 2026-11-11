@@ -1,8 +1,7 @@
 """
 Main analyzer class
 """
-from copy import deepcopy
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from smartresume.data import DataProcessor, FileProcessor
 from smartresume.data.text_extractor import TextExtractor
 from smartresume.model.llm_client import LLMClient
@@ -50,22 +49,33 @@ class ResumeAnalyzer:
     @staticmethod
     def _strip_page_images(processed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Return processed page data without embedded base64 images."""
-        sanitized_pages = []
-        for page_data in processed_data:
-            sanitized_page = deepcopy(page_data)
-            sanitized_page.pop("image", None)
-            sanitized_pages.append(sanitized_page)
-        return sanitized_pages
+        # Only the "image" key is dropped and the trace is only serialized, so a
+        # shallow copy is enough (a deepcopy re-copies every text box on every page).
+        return [
+            {key: value for key, value in page_data.items() if key != "image"}
+            for page_data in processed_data
+        ]
 
-    def pipeline_with_trace(self,
-                            cv_path: str,
-                            resume_id: str,
-                            extract_types: List[str] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _error_result(error: Exception, resume_id: str, cv_path: str) -> Dict[str, Any]:
+        error_details = {
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "resume_id": resume_id,
+            "file_path": cv_path
+        }
+        return {"error": str(error), "error_details": error_details}
+
+    def prepare_with_trace(self,
+                           cv_path: str,
+                           resume_id: str,
+                           extract_types: List[str] = None) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
         """
-        Complete resume analysis pipeline with intermediate trace data.
+        Pipeline stage 1: read the file (PDF text / OCR / layout) and build the LLM input.
 
         Returns:
-            Dict containing intermediate artifacts and final_result.
+            (trace, processed_data). On failure processed_data is None and
+            trace["final_result"] holds the error, as in pipeline_with_trace.
         """
         if extract_types is None:
             extract_types = ["basic_info"]
@@ -85,26 +95,51 @@ class ResumeAnalyzer:
             trace["text_lines"] = text_lines
             trace["text_content"] = text_content
             trace["indexed_text_content"] = indexed_text_content
-
-            structure_output = self.llm_client.extract_info(
-                indexed_text_content, extract_types, resume_id)
-            trace["structure_output"] = structure_output
-
-            final_result = self.data_processor.post_process(
-                text_lines, structure_output, processed_data)
-            trace["final_result"] = final_result
-
-            return trace
+            return trace, processed_data
 
         except Exception as e:
-            error_details = {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "resume_id": resume_id,
-                "file_path": cv_path
-            }
-            trace["final_result"] = {"error": str(e), "error_details": error_details}
+            trace["final_result"] = self._error_result(e, resume_id, cv_path)
+            return trace, None
+
+    def finish_with_trace(self,
+                          trace: Dict[str, Any],
+                          processed_data: List[Dict[str, Any]],
+                          structure_output: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pipeline stage 3: post-process the LLM output into trace["final_result"].
+        Stage 2 is llm_client.extract_info / extract_info_batch.
+        """
+        try:
+            trace["structure_output"] = structure_output
+            trace["final_result"] = self.data_processor.post_process(
+                trace["text_lines"], structure_output, processed_data)
+            self.data_processor.merge_pdf_links(trace["final_result"], trace["cv_path"])
+        except Exception as e:
+            trace["final_result"] = self._error_result(e, trace["resume_id"], trace["cv_path"])
+        return trace
+
+    def pipeline_with_trace(self,
+                            cv_path: str,
+                            resume_id: str,
+                            extract_types: List[str] = None) -> Dict[str, Any]:
+        """
+        Complete resume analysis pipeline with intermediate trace data.
+
+        Returns:
+            Dict containing intermediate artifacts and final_result.
+        """
+        trace, processed_data = self.prepare_with_trace(cv_path, resume_id, extract_types)
+        if processed_data is None:
             return trace
+
+        try:
+            structure_output = self.llm_client.extract_info(
+                trace["indexed_text_content"], trace["extract_types"], resume_id)
+        except Exception as e:
+            trace["final_result"] = self._error_result(e, resume_id, cv_path)
+            return trace
+
+        return self.finish_with_trace(trace, processed_data, structure_output)
 
     def process_file(self, file_path: str) -> List[Dict[str, Any]]:
         """

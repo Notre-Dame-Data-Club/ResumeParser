@@ -108,6 +108,15 @@ class Config:
             'auto_download': True
         }
 
+        # Direct (local transformers) model: how to load it
+        self.direct_model = {
+            'quantization': 'nf4',
+            'compute_dtype': 'float16',
+            'offload_per_layer_embeddings': True,
+            'max_new_tokens': 1024,
+            'gpu_memory_fraction': 0.88,
+        }
+
     def validate(self) -> list[str]:
         """Validate all configuration sections"""
         errors = []
@@ -235,6 +244,9 @@ class Config:
 
                 if 'direct_model_name' in yaml_config:
                     config.direct_model_name = yaml_config['direct_model_name']
+
+                if isinstance(yaml_config.get('direct_model'), dict):
+                    config.direct_model.update(yaml_config['direct_model'])
 
                 # Load model download config
                 if 'model_download' in yaml_config:

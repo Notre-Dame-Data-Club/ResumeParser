@@ -72,6 +72,42 @@ def auto_download_and_get_model_path(relative_path: str, model_type: ModelType =
     return cache_dir
 
 
+def llm_repo_id() -> str:
+    """
+    The Hugging Face repo of the configured LLM: config.direct_model_name when it is
+    a repo id ("google/gemma-4-E4B-it"), otherwise the default model.
+    """
+    from .config import config
+
+    name = str(getattr(config, 'direct_model_name', '') or '').strip().replace('\\', '/').rstrip('/')
+    if name.count('/') == 1 and not os.path.exists(name) and not name.startswith(('.', 'models/')):
+        return name
+    return ModelPath.GEMMA_4_E4B_IT_HF.value
+
+
+def download_llm(save_path: Optional[str] = None) -> str:
+    """
+    Download the configured LLM repo into <save_path>/<repo name>,
+    e.g. models/gemma-4-E4B-it. Files already present are reused.
+    """
+    from .config import config
+
+    if not HF_HUB_AVAILABLE:
+        raise ImportError("huggingface_hub not available. Install with: pip install huggingface_hub")
+
+    repo = llm_repo_id()
+    target = os.path.join(save_path or 'models', repo.split('/')[-1])
+    os.makedirs(target, exist_ok=True)
+    path = hf_snapshot_download(repo, local_dir=target)
+
+    ## Gemma "E" models: prepare the text-only export now rather than on the first run
+    from smartresume.model import text_export
+    if (getattr(config, 'direct_model', {}) or {}).get('offload_per_layer_embeddings', True) \
+            and text_export.needs_text_export(target):
+        text_export.ensure_text_export(target)
+    return path
+
+
 def get_model_path(model_type: ModelType) -> Optional[str]:
     from .config import config
     return config.model_download.get('models_dir', {}).get(model_type.value)
@@ -82,7 +118,7 @@ def download_model(model_type: ModelType, model_source: Optional[ModelSource] = 
         os.environ['SMARTRESUME_MODEL_SOURCE'] = model_source.value
 
     if model_type == ModelType.LLM:
-        return auto_download_and_get_model_path(ModelPath.QWEN3_0_6B.value, ModelType.LLM, save_path)
+        return download_llm(save_path)
     elif model_type == ModelType.LAYOUT:
         return auto_download_and_get_model_path(ModelPath.YOLOV10_MODEL.value, ModelType.LAYOUT, save_path)
     else:
@@ -91,7 +127,7 @@ def download_model(model_type: ModelType, model_source: Optional[ModelSource] = 
 
 if __name__ == '__main__':
     try:
-        llm_path = auto_download_and_get_model_path(ModelPath.QWEN3_0_6B.value, ModelType.LLM)
+        llm_path = download_llm()
         print(f"LLM model path: {llm_path}")
 
         layout_path = auto_download_and_get_model_path(ModelPath.YOLOV10_MODEL.value, ModelType.LAYOUT)

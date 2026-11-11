@@ -125,7 +125,7 @@ echo   SmartResume imports cleanly.
 
 REM ============================================================
 echo.
-echo [4/%TOTAL%] Models - Qwen3-0.6B + YOLOv10
+echo [4/%TOTAL%] Models - Gemma 4 E4B-it (~16 GB) + YOLOv10
 REM ============================================================
 if not exist "scripts\download_models.py" (
     echo   SKIPPED - scripts\download_models.py not found.

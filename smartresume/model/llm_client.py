@@ -2,23 +2,314 @@
 LLM client module
 """
 import json
+import logging
 import os
-from typing import Dict, List, Any
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor
 from smartresume.utils.config import config
 from smartresume.utils.prompts import get_prompts
+from smartresume.utils.schema import EXTRACT_TYPE_SECTIONS, LIST_SECTIONS, SECTION_ENTRY_KEYS
+from smartresume.data.sections import scoped_inputs
+from smartresume.model import text_export
 
 import random
 import json_repair
 
 # Direct model imports
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
     import torch
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+    StoppingCriteria = object
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_NEW_TOKENS = 1024
+## Longest prompt (template + resume text) sent to the model; longer resume text is cut
+MAX_PROMPT_TOKENS = 8192
+## GPU memory one batched token needs during generate() (KV cache, activations,
+## per-layer inputs). Measured on Gemma 4 E4B NF4: ~125 KB; rounded up for margin.
+DEFAULT_BYTES_PER_BATCH_TOKEN = 160 * 1024
+## VRAM kept free under the cap for the CUDA context / allocator fragmentation
+_GPU_SAFETY_BYTES = 300 * 1024 ** 2
+
+_DTYPES = {"float16": "float16", "fp16": "float16", "half": "float16",
+           "bfloat16": "bfloat16", "bf16": "bfloat16", "float32": "float32", "fp32": "float32"}
+
+
+# -- Loop detection -- #
+def _find_loop(tokens: List[int], min_span: int = 30, max_period: int = 120) -> bool:
+    """True when the end of tokens is one block repeated 3+ times, covering >= min_span tokens."""
+    n = len(tokens)
+    for period in range(2, min(max_period, n // 3) + 1):
+        span = period * max(3, -(-min_span // period))
+        if span > n:
+            continue
+        tail = tokens[-span:]
+        if tail[period:] == tail[:-period]:
+            return True
+    return False
+
+
+class _LoopGuard(StoppingCriteria):
+    """
+    Stop a row once its output starts repeating itself.
+
+    Small models sometimes fall into a loop ("Diving", "Musical Theater", ... over and
+    over) and would otherwise burn the whole token budget and never close their JSON.
+    Digit tokens are compared as equal, so a loop that only counts upward
+    ("2040", "2041", "2042", ...) is caught too. Rows are checked every few steps on
+    the last `window` tokens only, so it is cheap.
+    """
+
+    def __init__(self, prompt_width: int, stop_ids: Set[int], digit_ids: Set[int],
+                 check_every: int = 8, window: int = 400) -> None:
+        self.prompt_width = prompt_width
+        self.stop_ids = stop_ids
+        self.digit_ids = digit_ids
+        self.check_every = check_every
+        self.window = window
+        self.looped: List[bool] = []
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if not self.looped:
+            self.looped = [False] * input_ids.shape[0]
+        generated = input_ids.shape[1] - self.prompt_width
+        if generated >= 30 and generated % self.check_every == 0:
+            tails = input_ids[:, -min(generated, self.window):].tolist()
+            for row, tail in enumerate(tails):
+                ## A finished row is padded with EOS/PAD; that run is not a loop
+                if self.looped[row] or tail[-1] in self.stop_ids:
+                    continue
+                masked = [-1 if token in self.digit_ids else token for token in tail]
+                if _find_loop(masked):
+                    self.looped[row] = True
+        return torch.tensor(self.looped, dtype=torch.bool, device=input_ids.device)
+
+
+class _CpuEmbedding(torch.nn.Module if TRANSFORMERS_AVAILABLE else object):
+    """
+    Embedding lookup kept in system RAM (Gemma per-layer embeddings, 5.6 GB in E4B).
+
+    Ids are moved to the CPU, rows are gathered there and only the gathered rows
+    (a few MB) go to the GPU. Same result as Gemma4TextScaledWordEmbedding: rows
+    times embed_scale.
+    """
+
+    def __init__(self, weight, scale: float, out_device, out_dtype) -> None:
+        super().__init__()
+        self.register_buffer("weight", weight, persistent=False)
+        self.scale = scale
+        self.out_device = out_device
+        self.out_dtype = out_dtype
+        self.num_embeddings, self.embedding_dim = weight.shape
+
+    def forward(self, input_ids):
+        rows = torch.nn.functional.embedding(input_ids.to(self.weight.device), self.weight)
+        ## Scale on the GPU, in the compute dtype (the table itself stays bf16 in RAM)
+        return rows.to(self.out_device).to(self.out_dtype) * self.scale
+
+
+# -- Response parsing -- #
+_REPEATED_TEXT = re.compile(r"(.{10,}?)\1{2,}", re.DOTALL)
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+## One "key": value pair, for salvaging entries out of broken JSON
+_JSON_STRING = r'"(?:[^"\\]|\\.)*"'
+_PAIR = re.compile(
+    r'"(?P<key>[A-Za-z_][\w]*)"\s*:\s*(?P<value>'
+    + _JSON_STRING
+    + r'|\[[^\[\]]*\]|-?\d+(?:\.\d+)?|true|false|null)'
+)
+
+
+def _dedupe(value: Any) -> Any:
+    """Drop repeats left over from a loop: repeated list items and repeated text runs."""
+    if isinstance(value, str):
+        return _REPEATED_TEXT.sub(r"\1", value)
+    if isinstance(value, dict):
+        return {key: _dedupe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        seen, kept = set(), []
+        for item in value:
+            item = _dedupe(item)
+            marker = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+            if marker not in seen:
+                seen.add(marker)
+                kept.append(item)
+        return kept
+    return value
+
+
+def _keep_entry_keys(entry: Dict[str, Any], allowed: Tuple[str, ...]) -> Dict[str, Any]:
+    """Only the template's keys survive ("Do not add keys" is not always obeyed)."""
+    if not allowed:
+        return dict(entry)
+    return {key: entry[key] for key in allowed if key in entry}
+
+
+def _normalize_section(parsed: Any, section: str) -> Dict[str, Any]:
+    """
+    Reduce a parsed answer to {section: value} with only template keys per entry.
+
+    Keys outside the section (left over when broken JSON is repaired, e.g. a stray
+    "name" at the top level) are dropped instead of being merged into the result.
+    An answer that forgot the {"section": ...} wrapper is wrapped.
+    """
+    if not isinstance(parsed, dict):
+        parsed = {section: parsed} if isinstance(parsed, list) else {}
+    allowed = SECTION_ENTRY_KEYS.get(section, ())
+
+    if section in parsed:
+        body = parsed[section]
+    elif allowed and any(key in parsed for key in allowed):
+        body = parsed  # bare entry without the wrapper
+    else:
+        return {}
+
+    if section in LIST_SECTIONS:
+        if isinstance(body, dict):
+            body = [body]
+        if not isinstance(body, list):
+            return {section: []}
+        return {section: [_keep_entry_keys(e, allowed) for e in body if isinstance(e, dict)]}
+
+    return {section: _keep_entry_keys(body, allowed) if isinstance(body, dict) else {}}
+
+
+## Keys that name an entry; an entry without any of them is a fragment, not an entry
+_IDENTITY_KEYS: Dict[str, Tuple[str, ...]] = {
+    "workExperience": ("companyName", "position"),
+    "education": ("school", "major"),
+    "projects": ("name",),
+}
+
+
+def _has_identity(entry: Dict[str, Any], section: str) -> bool:
+    return any(str(entry.get(key) or "").strip() for key in _IDENTITY_KEYS.get(section, ()))
+
+
+def _scan_entries(text: str, section: str) -> List[Dict[str, Any]]:
+    """
+    Salvage list entries from JSON too broken to repair structurally.
+
+    A small model sometimes forgets the "}, {" between entries and writes every
+    entry's keys into one object. A JSON parser then keeps only the last value of
+    each key (5 projects become 1). Instead, every "key": value pair is read in
+    order and a new entry starts when the entry's anchor key (its first template
+    key, e.g. "name") repeats. Any other repeated key keeps its first value: the
+    model sometimes appends further "technologies" lists copied from other entries.
+    """
+    allowed = SECTION_ENTRY_KEYS.get(section, ())
+    if not allowed:
+        return []
+    anchor = allowed[0]
+    entries: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {}
+    for match in _PAIR.finditer(text):
+        key = match.group("key")
+        if key not in allowed:
+            continue
+        raw_value = match.group("value")
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = json_repair.loads(raw_value)
+        starts_entry = key == anchor and anchor in current
+        ## An entry whose anchor was skipped: a repeated key is the only boundary signal
+        starts_entry = starts_entry or (key in current and anchor not in current)
+        if starts_entry:
+            entries.append(current)
+            current = {}
+        current.setdefault(key, value)
+    if current:
+        entries.append(current)
+    return [e for e in entries if _has_identity(e, section)]
+
+
+class _DuplicateKeys(Exception):
+    """An object in the answer repeats a key (entries were merged into one object)."""
+
+
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise _DuplicateKeys(keys)
+    return dict(pairs)
+
+
+def parse_llm_response(response: str, prompt_key: str, truncated: bool = False) -> Dict[str, Any]:
+    """
+    Pull the JSON answer for one extraction type out of a model response.
+
+    Returns {section: value} for the prompt's own section only ({} if nothing usable).
+    A truncated response (stopped by the loop guard or the token cap) never closes
+    its JSON; its open brackets are closed and every entry written before the cut is
+    kept, with the looped repeats removed. Quotes inside the text are left alone (an
+    apostrophe in "O'Brien" is valid JSON and must not be turned into a quote).
+    """
+    section = EXTRACT_TYPE_SECTIONS.get(prompt_key, prompt_key)
+    text = _THINK_BLOCK.sub("", response or "").strip()
+
+    start = text.find("{")
+    if start == -1:
+        return {}
+    body = text[start:]
+
+    parsed: Any = None
+    strict = False
+    duplicate_keys = False
+    end = body.rfind("}")
+    if not truncated and end != -1:
+        try:
+            parsed = json.loads(body[:end + 1], object_pairs_hook=_reject_duplicate_keys)
+            strict = True
+        except _DuplicateKeys:
+            ## A plain parse would silently keep the last value of each repeated key
+            duplicate_keys = True
+            try:
+                parsed = json.loads(body[:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+        except json.JSONDecodeError:
+            parsed = None
+    if parsed is None:
+        try:
+            parsed = json_repair.loads(body)
+        except Exception:
+            parsed = {}
+
+    result = _normalize_section(parsed, section)
+
+    if not strict and section in LIST_SECTIONS:
+        parsed_entries = [e for e in result.get(section, []) if _has_identity(e, section)]
+        scanned = _scan_entries(body, section)
+        ## The scan keeps first values of repeated keys, so it wins ties on duplicate keys
+        if len(scanned) > len(parsed_entries) or (duplicate_keys and len(scanned) == len(parsed_entries)):
+            result = {section: scanned}
+
+    return result if strict else _dedupe(result)
+
+
+def _merge_result(combined: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Merge one prompt's answer: lists from several sections are joined, other keys replaced."""
+    for key, value in result.items():
+        if isinstance(value, list) and isinstance(combined.get(key), list):
+            combined[key].extend(value)
+        else:
+            combined[key] = list(value) if isinstance(value, list) else value
+
+
+def _count_entries(result: Dict[str, Any], prompt_key: str) -> int:
+    """Entries in this prompt's own section (a dict section counts as 1 when non-empty)."""
+    value = result.get(EXTRACT_TYPE_SECTIONS.get(prompt_key, prompt_key))
+    if isinstance(value, list):
+        return len(value)
+    return 1 if value else 0
 
 
 class LLMClient:
@@ -32,6 +323,14 @@ class LLMClient:
         self.use_direct_models = getattr(config, 'use_direct_models', False)
         self.direct_model = None
         self.direct_tokenizer = None
+        self.stop_ids: Set[int] = set()
+        self.eos_ids: List[int] = []
+        self.pad_id: int = 0
+        self.digit_ids: Set[int] = set()
+        self.max_new_tokens = int((getattr(config, 'direct_model', {}) or {}).get(
+            'max_new_tokens', DEFAULT_MAX_NEW_TOKENS))
+        ## Max rows x (prompt + new tokens) per generate() call; 0 = no limit (CPU)
+        self.token_budget = 0
         self._init_direct_model()
 
         self.default_client = None
@@ -62,81 +361,167 @@ class LLMClient:
                 except Exception:
                     pass
 
+    # -- Direct model loading -- #
+    @staticmethod
+    def _resolve_local_model_path(direct_model_name: str) -> Optional[str]:
+        """The local folder of the configured model, or None if it is not downloaded."""
+        models_dir = getattr(config, 'model_download', {}).get('models_dir', {}).get('llm', 'models') or 'models'
+        if os.path.isdir(direct_model_name):
+            return direct_model_name
+        for path in (
+            os.path.join(models_dir, direct_model_name),
+            os.path.join(models_dir, os.path.basename(direct_model_name)),
+            os.path.join('models', direct_model_name),
+            os.path.join('models', os.path.basename(direct_model_name)),
+        ):
+            if os.path.isdir(path):
+                return path
+        return None
+
     def _init_direct_model(self) -> None:
-        """Initialize direct model loading"""
+        """Load the local model (NF4-quantized on GPU when configured)."""
         if not self.use_direct_models or not TRANSFORMERS_AVAILABLE:
             return
 
         try:
             direct_model_name = getattr(config, 'direct_model_name', None)
             if not direct_model_name:
-                print("Warning: use_direct_models is True but direct_model_name is not configured")
+                logger.warning("use_direct_models is True but direct_model_name is not configured")
                 return
 
-            # Try to find model in local models directory first
-            local_model_path = None
-            models_dir = getattr(config, 'model_download', {}).get('models_dir', {}).get('llm', 'models')
-
-            # Check if it's already a local path
-            if os.path.exists(direct_model_name):
-                local_model_path = direct_model_name
-            else:
-                # Try to find in models directory
-                possible_paths = [
-                    os.path.join(models_dir, direct_model_name),
-                    os.path.join(models_dir, os.path.basename(direct_model_name)),
-                    os.path.join('models', direct_model_name),
-                    os.path.join('models', os.path.basename(direct_model_name))
-                ]
-
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        local_model_path = path
-                        break
-
-            # If local model not found, try to download it
+            local_model_path = self._resolve_local_model_path(direct_model_name)
             if not local_model_path:
-                print(f"Local model not found, attempting to download: {direct_model_name}")
+                from ..utils.models_download_utils import download_llm, llm_repo_id
+                logger.info("Local model not found, downloading: %s", llm_repo_id())
                 try:
-                    from ..utils.models_download_utils import download_model
-                    from ..utils.model_paths import ModelType, ModelSource
-                    download_model(ModelType.LLM, ModelSource.HUGGINGFACE, models_dir)
-                    # Try to find the downloaded model
-                    for path in possible_paths:
-                        if os.path.exists(path):
-                            local_model_path = path
-                            break
+                    models_dir = getattr(config, 'model_download', {}).get('models_dir', {}).get('llm', 'models')
+                    download_llm(models_dir or 'models')
+                    local_model_path = self._resolve_local_model_path(direct_model_name)
                 except Exception as download_error:
-                    print(f"Failed to download model: {download_error}")
-                    # Fall back to using the original model name (might be from HuggingFace)
-                    local_model_path = direct_model_name
+                    logger.error("Failed to download model: %s", download_error)
+                if not local_model_path:
+                    ## Last resort: let transformers resolve a Hub repo id
+                    local_model_path = llm_repo_id()
 
-            print(f"Loading direct model from: {local_model_path}")
+            options = getattr(config, 'direct_model', {}) or {}
+            dtype = getattr(torch, _DTYPES.get(str(options.get('compute_dtype', 'float16')).lower(), 'float16'))
+            quantization = str(options.get('quantization', 'nf4')).lower()
+            cpu_ple = bool(options.get('offload_per_layer_embeddings', True))
+            on_gpu = torch.cuda.is_available()
 
-            # Load tokenizer
-            self.direct_tokenizer = AutoTokenizer.from_pretrained(
-                local_model_path,
-                trust_remote_code=True
-            )
+            ## Gemma "E" models: load a text-only export whose per-layer embeddings stay in RAM
+            if on_gpu and cpu_ple and text_export.needs_text_export(local_model_path):
+                local_model_path = text_export.ensure_text_export(local_model_path)
+            use_cpu_ple = on_gpu and text_export.has_cpu_ple(local_model_path)
 
-            # Load model
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.direct_model = AutoModelForCausalLM.from_pretrained(
-                local_model_path,
-                trust_remote_code=True,
-                dtype=torch.float16 if device == "cuda" else torch.float32,
-                device_map="auto" if device == "cuda" else None
-            )
+            logger.info("Loading direct model from: %s (%s, %s, %s%s)", local_model_path,
+                        "cuda" if on_gpu else "cpu",
+                        quantization if on_gpu else "no quantization", str(dtype).replace("torch.", ""),
+                        ", per-layer embeddings in RAM" if use_cpu_ple else "")
 
-            if device == "cpu":
-                self.direct_model = self.direct_model.to(device)
+            self.direct_tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
 
-            print(f"Direct model loaded successfully on {device}")
+            model_config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
+            ple_rows = None
+            if use_cpu_ple:
+                ## A 1-row placeholder table: the real one is attached on the CPU after loading
+                ple_rows = model_config.vocab_size_per_layer_input
+                model_config.vocab_size_per_layer_input = 1
+
+            load_kwargs: Dict[str, Any] = {
+                "config": model_config,
+                "trust_remote_code": True,
+                "dtype": dtype if on_gpu else torch.float32,
+            }
+            if on_gpu:
+                load_kwargs["device_map"] = {"": 0}
+                if quantization == "nf4":
+                    from transformers import BitsAndBytesConfig
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=dtype,
+                        bnb_4bit_use_double_quant=True,
+                        llm_int8_skip_modules=["lm_head"],
+                    )
+
+            self.direct_model = AutoModelForCausalLM.from_pretrained(local_model_path, **load_kwargs)
+            if not on_gpu:
+                self.direct_model = self.direct_model.to("cpu")
+            self.direct_model.eval()
+
+            if use_cpu_ple:
+                self._attach_cpu_ple(local_model_path, dtype)
+                self.direct_model.config.vocab_size_per_layer_input = ple_rows
+            self._init_token_ids()
+
+            if on_gpu:
+                self._set_gpu_budget(options)
+                logger.info("Direct model loaded: %.2f GB on GPU", torch.cuda.memory_allocated() / 1024 ** 3)
+            else:
+                logger.info("Direct model loaded on CPU")
 
         except Exception as e:
-            print(f"Failed to load direct model: {e}")
+            logger.error("Failed to load direct model: %s", e, exc_info=True)
             self.direct_model = None
             self.direct_tokenizer = None
+
+    def _set_gpu_budget(self, options: Dict[str, Any]) -> None:
+        """
+        Cap PyTorch's share of VRAM and size generate() calls to fit under the cap.
+
+        Without a cap, Windows lets CUDA spill into shared system memory once VRAM is
+        full instead of raising out-of-memory, and generation slows to a crawl. With
+        it, an oversized call fails fast and is retried one prompt at a time.
+        """
+        total = torch.cuda.get_device_properties(0).total_memory
+        gb = options.get('gpu_memory_gb')
+        fraction = (float(gb) * 1024 ** 3 / total) if gb else float(options.get('gpu_memory_fraction', 0.88))
+        fraction = max(0.1, min(fraction, 1.0))
+        torch.cuda.set_per_process_memory_fraction(fraction, 0)
+
+        headroom = fraction * total - torch.cuda.memory_allocated() - _GPU_SAFETY_BYTES
+        bytes_per_token = int(options.get('bytes_per_batch_token', DEFAULT_BYTES_PER_BATCH_TOKEN))
+        self.token_budget = max(0, int(headroom // bytes_per_token))
+        logger.info("GPU cap %.2f GB; generate() budget %d batch tokens (rows x (prompt + %d new))",
+                    fraction * total / 1024 ** 3, self.token_budget, self.max_new_tokens)
+
+    def _attach_cpu_ple(self, model_path: str, dtype) -> None:
+        """Swap the placeholder per-layer embedding for the real table, held in RAM."""
+        from safetensors import safe_open
+
+        with safe_open(os.path.join(model_path, text_export.PLE_FILE), framework="pt") as reader:
+            weight = reader.get_tensor(text_export.PLE_KEY)
+
+        for name, module in list(self.direct_model.named_modules()):
+            if not name.endswith("embed_tokens_per_layer"):
+                continue
+            parent_name, _, attr = name.rpartition(".")
+            parent = self.direct_model.get_submodule(parent_name)
+            scale = float(getattr(module, "scalar_embed_scale", 1.0))
+            setattr(parent, attr, _CpuEmbedding(weight, scale, torch.device("cuda", 0), dtype))
+            logger.info("Per-layer embeddings in RAM: %s (%.1f GB)", tuple(weight.shape),
+                        weight.numel() * weight.element_size() / 1024 ** 3)
+            return
+        raise RuntimeError("Model has no embed_tokens_per_layer module to attach the table to")
+
+    def _init_token_ids(self) -> None:
+        """EOS ids (Gemma has several), the pad id, and which tokens are digits."""
+        tokenizer = self.direct_tokenizer
+        eos: List[int] = []
+        gen_eos = getattr(getattr(self.direct_model, "generation_config", None), "eos_token_id", None)
+        for value in (gen_eos, tokenizer.eos_token_id):
+            if isinstance(value, int):
+                eos.append(value)
+            elif isinstance(value, (list, tuple)):
+                eos.extend(v for v in value if isinstance(v, int))
+        self.eos_ids = list(dict.fromkeys(eos))
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else self.eos_ids[0]
+        self.stop_ids = set(self.eos_ids) | {self.pad_id}
+        self.digit_ids = {
+            token_id for token, token_id in tokenizer.get_vocab().items()
+            if token.lstrip("▁Ġ ").isdigit()
+        }
 
     def _get_client(self, extract_type: str, use_backup_channel: bool = False) -> OpenAI:
         """Get the client for a given extraction type"""
@@ -230,55 +615,41 @@ class LLMClient:
                 try:
                     completion = client.chat.completions.create(**params)
                     content = completion.choices[0].message.content
-                    content = content.replace('\\"', '"')
-
-                    json_start = content.find("{")
-                    json_end = content.rfind("}") + 1
-
-                    if json_start != -1 and json_end > json_start:
-                        content = content[json_start:json_end]
-                        try:
-                            return json.loads(content)
-                        except json.JSONDecodeError:
-                            content = content.replace("'", '"')
-                            content = content.replace('True', 'true')
-                            content = content.replace('False', 'false')
-                            content = content.replace('None', 'null')
-                            return json_repair.loads(content)
-                    else:
+                    truncated = completion.choices[0].finish_reason == "length"
+                    result = parse_llm_response(content, prompt_key, truncated=truncated)
+                    if not result:
                         raise ValueError("No valid JSON content found")
+                    return result
 
                 except Exception as e:
                     if attempt < max_retries:
                         continue
-                    else:
-                        pass
-                        os.makedirs("contents", exist_ok=True)
-                        error_info = {
-                            "error_type": type(e).__name__,
-                            "error_message": str(e),
-                            "prompt_key": prompt_key,
-                            "channel_config": {
-                                "name": channel_config.name,
-                                "api_url": channel_config.api_url,
-                                "max_tokens": channel_config.max_tokens
-                            },
-                            "params": params
-                        }
-                        with open(
-                            f"contents/{resume_id}_{prompt_key}_error.json",
-                            "w",
-                            encoding='utf-8',
-                        ) as f:
-                            json.dump(error_info, f, ensure_ascii=False, indent=2)
-                        return {}
+                    os.makedirs("contents", exist_ok=True)
+                    error_info = {
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                        "prompt_key": prompt_key,
+                        "channel_config": {
+                            "name": channel_config.name,
+                            "api_url": channel_config.api_url,
+                            "max_tokens": channel_config.max_tokens
+                        },
+                        "params": params
+                    }
+                    with open(
+                        f"contents/{resume_id}_{prompt_key}_error.json",
+                        "w",
+                        encoding='utf-8',
+                    ) as f:
+                        json.dump(error_info, f, ensure_ascii=False, indent=2)
+                    return {}
 
         with ThreadPoolExecutor() as executor:
             results = list(executor.map(call_llm, extract_types))
 
-        combined_result = {}
+        combined_result: Dict[str, Any] = {}
         for result in results:
-            combined_result.update(result)
+            _merge_result(combined_result, result)
 
         return combined_result
 
@@ -296,112 +667,238 @@ class LLMClient:
         Returns:
             A dictionary with extracted fields
         """
+        self._require_direct_model()
+        # One prompt per generate() call (to avoid memory issues)
+        results, _ = self._extract_direct_jobs([(resume_id, text_content)], extract_types, batch_size=1)
+        return results[0]
+
+    def extract_info_batch(self, jobs: List[Tuple[str, str]], extract_types: List[str],
+                           batch_size: int = 4, return_calls: bool = False):
+        """
+        Extract several resumes, running up to batch_size prompts per generate() call.
+
+        Each extraction type reads only its own resume section (see data/sections.py);
+        work experience gets one prompt per section. A batch that fails (e.g. out of
+        memory under --gpu-memory) is retried one prompt at a time.
+
+        Args:
+            jobs: (resume_id, indexed text_content) pairs
+            extract_types: List of extraction types to run for every resume
+            batch_size: Prompts per generate() call; 1 means one prompt at a time
+            return_calls: Also return, per job, a log of every prompt (section, stop
+                reason, token count, raw response)
+
+        Returns:
+            One combined result dict per job, in the same order as jobs
+            (and the per-job call logs when return_calls is True)
+        """
+        if not self.use_direct_models:
+            results = [self.extract_info(text, extract_types, resume_id) for resume_id, text in jobs]
+            calls: List[List[Dict[str, Any]]] = [[] for _ in jobs]
+        else:
+            self._require_direct_model()
+            results, calls = self._extract_direct_jobs(jobs, extract_types, max(1, batch_size))
+        return (results, calls) if return_calls else results
+
+    def _extract_direct_jobs(self, jobs: List[Tuple[str, str]], extract_types: List[str],
+                             batch_size: int) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+        """Run every (resume, extraction type, section) prompt; merge the answers per resume."""
+        prompts: List[Dict[str, Any]] = []
+        for job_idx, (resume_id, text) in enumerate(jobs):
+            for prompt_key in extract_types:
+                for scoped in scoped_inputs(text, prompt_key):
+                    entry: Dict[str, Any] = {
+                        "job": job_idx,
+                        "extract_type": prompt_key,
+                        "section": scoped["section"],
+                        "line_range": scoped["line_range"],
+                    }
+                    prompts.append(entry)
+                    try:
+                        entry["ids"] = self._encode_direct_prompt(prompt_key, scoped["text"])
+                    except Exception as e:
+                        entry["result"] = self._record_direct_error(resume_id, prompt_key, e)
+                        entry.update(stop_reason="error", error=str(e))
+
+        # Prompts of similar length share a batch, so less padding is computed
+        pending = sorted((p for p in prompts if "ids" in p), key=lambda p: len(p["ids"]))
+
+        for chunk in self._plan_batches(pending, batch_size):
+            try:
+                outputs = self._generate_direct([p["ids"] for p in chunk])
+            except Exception as e:
+                if len(chunk) > 1:
+                    logger.warning("Batch of %d prompts failed (%s); retrying one at a time.", len(chunk), e)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                outputs = [None] * len(chunk)
+
+            for entry, output in zip(chunk, outputs):
+                resume_id = jobs[entry["job"]][0]
+                prompt_key = entry["extract_type"]
+                try:
+                    if output is None:  # batch failed: retry this prompt alone
+                        output = self._generate_direct([entry["ids"]])[0]
+                    raw, stop_reason, new_tokens = output
+                    entry.update(stop_reason=stop_reason, new_tokens=new_tokens, raw_response=raw)
+                    entry["result"] = parse_llm_response(raw, prompt_key, truncated=stop_reason != "eos")
+                except Exception as e:
+                    entry["result"] = self._record_direct_error(resume_id, prompt_key, e)
+                    entry.update(stop_reason="error", error=str(e))
+
+        # Merge in extract_types order, sections top to bottom, like the sequential path
+        type_order = {key: i for i, key in enumerate(extract_types)}
+        prompts.sort(key=lambda p: (p["job"], type_order[p["extract_type"]], (p["line_range"] or [0])[0]))
+
+        results: List[Dict[str, Any]] = [{} for _ in jobs]
+        calls: List[List[Dict[str, Any]]] = [[] for _ in jobs]
+        for entry in prompts:
+            result = entry.pop("result", {})
+            _merge_result(results[entry["job"]], result)
+            entry.pop("ids", None)
+            entry["entries"] = _count_entries(result, entry["extract_type"])
+            calls[entry.pop("job")].append(entry)
+        return results, calls
+
+    def _plan_batches(self, pending: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
+        """
+        Split length-sorted prompts into generate() calls that fit in GPU memory.
+
+        A call holds every row until its longest answer ends, so its peak memory grows
+        with rows x (longest prompt + max_new_tokens). Rows are added while that stays
+        within self.token_budget (measured at load time) and below batch_size.
+        """
+        batches: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for entry in pending:  # ascending length: the newest entry is the widest
+            rows = len(current) + 1
+            cost = rows * (len(entry["ids"]) + self.max_new_tokens)
+            if current and (rows > batch_size or (self.token_budget and cost > self.token_budget)):
+                batches.append(current)
+                current = []
+            current.append(entry)
+        if current:
+            batches.append(current)
+        return batches
+
+    # -- Direct model helpers (shared by the sequential and batched paths) -- #
+    def _require_direct_model(self) -> None:
         if not self.direct_model or not self.direct_tokenizer:
             raise RuntimeError(
                 "Direct model not loaded and use_direct_models=true — no remote "
                 "fallback is attempted. Check direct_model_name and model files."
             )
 
-        def call_direct_llm(prompt_key: str) -> Dict[str, Any]:
-            """Call direct model for a single extraction type"""
-            try:
-                # Prepare prompt
-                system_prompt = self.prompts[prompt_key]
-                user_prompt = text_content
+    def _format_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        tokenizer = self.direct_tokenizer
+        if getattr(tokenizer, 'chat_template', None):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            ## enable_thinking=False: no reasoning block, the token budget goes to the JSON
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
 
-                # Format prompt based on model type
-                if hasattr(self.direct_tokenizer, 'chat_template') and self.direct_tokenizer.chat_template:
-                    # Use chat template if available
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]
-                    prompt = self.direct_tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True
-                    )
-                else:
-                    # Fallback to simple format
-                    prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
+    def _encode_direct_prompt(self, prompt_key: str, text_content: str) -> List[int]:
+        """
+        Format one extraction prompt and tokenize it.
 
-                # Tokenize input
-                inputs = self.direct_tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=4096
-                )
+        The chat template already writes the BOS token, so the tokenizer must not add
+        a second one. Over-long resume text is shortened, never the template around it
+        (cutting the end would drop the assistant turn the model answers in).
+        """
+        system_prompt = self.prompts[prompt_key]
+        ids = self._tokenize(self._format_prompt(system_prompt, text_content))
+        if len(ids) > MAX_PROMPT_TOKENS:
+            keep = max(200, int(len(text_content) * MAX_PROMPT_TOKENS / len(ids) * 0.95))
+            logger.warning("%s prompt is %d tokens; resume text cut to %d chars.", prompt_key, len(ids), keep)
+            ids = self._tokenize(self._format_prompt(system_prompt, text_content[:keep]))
+        return ids
 
-                # Move to device
-                device = next(self.direct_model.parameters()).device
-                inputs = {k: v.to(device) for k, v in inputs.items()}
+    def _tokenize(self, prompt: str) -> List[int]:
+        return self.direct_tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-                # Generate response
-                with torch.no_grad():
-                    outputs = self.direct_model.generate(
-                        **inputs,
-                        max_new_tokens=1024,
-                        temperature=0.1,
-                        do_sample=True,
-                        pad_token_id=self.direct_tokenizer.eos_token_id,
-                        eos_token_id=self.direct_tokenizer.eos_token_id
-                    )
+    def _generate_direct(self, id_lists: List[List[int]]) -> List[Tuple[str, str, int]]:
+        """
+        Generate a response for each tokenized prompt in one generate() call (greedy).
 
-                # Decode response
-                response = self.direct_tokenizer.decode(
-                    outputs[0][inputs['input_ids'].shape[1]:],
-                    skip_special_tokens=True
-                )
+        Returns (text, stop_reason, new_tokens) per prompt; stop_reason is "eos" (finished
+        normally), "loop" (stopped because it repeated itself) or "max_tokens" (cut off).
+        """
+        tokenizer = self.direct_tokenizer
+        pad_id = self.pad_id
 
-                # Clean up response
-                response = response.strip()
-                response = response.replace('\\"', '"')
+        # Left-pad so every prompt ends at the same position and generation starts together
+        width = max(len(ids) for ids in id_lists)
+        input_ids = torch.full((len(id_lists), width), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(id_lists), width), dtype=torch.long)
+        for row, ids in enumerate(id_lists):
+            input_ids[row, width - len(ids):] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[row, width - len(ids):] = 1
 
-                # Extract JSON from response
-                json_start = response.find("{")
-                json_end = response.rfind("}") + 1
+        device = self.direct_model.get_input_embeddings().weight.device
+        guard = _LoopGuard(prompt_width=width, stop_ids=self.stop_ids, digit_ids=self.digit_ids)
+        with torch.no_grad():
+            outputs = self.direct_model.generate(
+                input_ids=input_ids.to(device),
+                attention_mask=attention_mask.to(device),
+                max_new_tokens=self.max_new_tokens,
+                ## Greedy: the same resume gives the same answer on every run
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+                pad_token_id=pad_id,
+                eos_token_id=self.eos_ids,
+                stopping_criteria=StoppingCriteriaList([guard]),
+            )
 
-                if json_start != -1 and json_end > json_start:
-                    json_content = response[json_start:json_end]
-                    try:
-                        return json.loads(json_content)
-                    except json.JSONDecodeError:
-                        # Try to repair JSON
-                        json_content = json_content.replace("'", '"')
-                        json_content = json_content.replace('True', 'true')
-                        json_content = json_content.replace('False', 'false')
-                        json_content = json_content.replace('None', 'null')
-                        return json_repair.loads(json_content)
-                else:
-                    print(f"No valid JSON found in response for {prompt_key}")
-                    return {}
+        results = []
+        for row, seq in enumerate(outputs):
+            new = seq[width:].tolist()
+            end = next((i for i, token in enumerate(new) if token in self.stop_ids), None)
+            ## Rows that stop early are padded, so the loop flag is checked first
+            if guard.looped and guard.looped[row]:
+                stop_reason = "loop"
+            elif end is not None:
+                stop_reason = "eos"
+            elif len(new) >= self.max_new_tokens:
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = "eos"
+            new_tokens = end if end is not None else len(new)
+            results.append((tokenizer.decode(new[:new_tokens], skip_special_tokens=True), stop_reason, new_tokens))
+        del outputs
+        ## Calls differ in shape; returning cached blocks keeps the pool from fragmenting
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return results
 
-            except Exception as e:
-                print(f"Error in direct model call for {prompt_key}: {e}")
-                # Save error info for debugging
-                os.makedirs("contents", exist_ok=True)
-                error_info = {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "prompt_key": prompt_key,
-                    "model_name": getattr(config, 'direct_model_name', 'unknown')
-                }
-                with open(
-                    f"contents/{resume_id}_{prompt_key}_direct_error.json",
-                    "w",
-                    encoding='utf-8',
-                ) as f:
-                    json.dump(error_info, f, ensure_ascii=False, indent=2)
-                return {}
+    @staticmethod
+    def _parse_direct_response(response: str, prompt_key: str, truncated: bool = False) -> Dict[str, Any]:
+        """Kept for callers of the old name; see parse_llm_response."""
+        return parse_llm_response(response, prompt_key, truncated)
 
-        # Process all extraction types sequentially (to avoid memory issues)
-        combined_result = {}
-        for extract_type in extract_types:
-            result = call_direct_llm(extract_type)
-            combined_result.update(result)
-
-        return combined_result
+    @staticmethod
+    def _record_direct_error(resume_id: str, prompt_key: str, error: Exception) -> Dict[str, Any]:
+        """Save error info for debugging and return an empty result."""
+        logger.error("Error in direct model call for %s: %s", prompt_key, error)
+        os.makedirs("contents", exist_ok=True)
+        error_info = {
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "prompt_key": prompt_key,
+            "model_name": getattr(config, 'direct_model_name', 'unknown')
+        }
+        with open(
+            f"contents/{resume_id}_{prompt_key}_direct_error.json",
+            "w",
+            encoding='utf-8',
+        ) as f:
+            json.dump(error_info, f, ensure_ascii=False, indent=2)
+        return {}
 
     def extract_info(self, text_content: str, extract_types: List[str],
                      resume_id: str, use_backup_channel: bool = False) -> Dict[str, Any]:

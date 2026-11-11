@@ -13,6 +13,7 @@ import logging
 import shutil
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +43,11 @@ def apply_gpu_memory_limit(gb: float) -> None:
     GPU limit to make sure your computer doesn't die in the name of Data Club.
     You are welcome :)
     '''
+    ## The LLM loader applies this cap (and sizes its batches to it) after loading
+    try:
+        _load_config().direct_model['gpu_memory_gb'] = gb
+    except Exception:
+        pass
     try:
         import torch
         if _cuda_available():
@@ -217,10 +223,15 @@ class ProgressTracker:
         logger.info(status)
 
         # Flush both stdout and file handlers for immediate display
-        sys.stdout.flush()
-        for handler in logger.handlers:
-            if hasattr(handler, 'flush'):
-                handler.flush()
+        _flush_logs()
+
+
+def _flush_logs() -> None:
+    '''Flush stdout and every log handler so progress shows up immediately.'''
+    sys.stdout.flush()
+    for handler in logging.root.handlers + logger.handlers:
+        if hasattr(handler, 'flush'):
+            handler.flush()
 
 def log_device_info() -> None:
     '''Log GPU/CPU info if PyTorch is available.'''
@@ -311,15 +322,22 @@ class WindowsResumeProcessor:
     Main connection with .bat file
     """
 
+    ## Trace keys left out of parsing_history.jsonl (kept in the per-resume detail file)
+    _HEAVY_TRACE_KEYS = frozenset({"processed_pages", "text_content", "indexed_text_content"})
+    ## Typical prompts per resume: basic info, education, projects + ~3 work sections
+    _PROMPTS_PER_RESUME = 6
+
     def __init__(
         self,
         pdf_raw_text: bool,
         force_ocr: bool,
         no_layout_detection: bool,
         page_limit: int,
+        batch_size: int = 8,
     ) -> None:
         ResumeAnalyzer = _load_analyzer_class()
         self.EXTRACT_TYPES = _load_extract_types()
+        self.batch_size = max(1, batch_size)
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.logs_dir = LOGS_DIR
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -334,6 +352,12 @@ class WindowsResumeProcessor:
         try:
             logger.info("Initialising ResumeAnalyzer (loading model + OCR)…")
             self.analyzer = ResumeAnalyzer()
+            llm = self.analyzer.llm_client
+            if llm is not None and llm.use_direct_models and llm.direct_model is None:
+                raise RuntimeError(
+                    "The local LLM failed to load (see the error above). Check direct_model_name "
+                    "in configs/config.yaml and that the model files are downloaded."
+                )
             logger.info("Analyzer ready.")
         except Exception:
             self._restore_config_overrides()
@@ -377,9 +401,13 @@ class WindowsResumeProcessor:
             encoding="utf-8",
         )
 
+        ## The history file is appended to on every run, so it gets a slim copy: the
+        ## per-page OCR boxes and the duplicate text copies stay in the detail file only.
+        slim_trace = {k: v for k, v in safe_record["trace"].items() if k not in self._HEAVY_TRACE_KEYS}
+        slim_record = {**safe_record, "trace": slim_trace, "detail_file": detail_path.name}
         history_path = self.logs_dir / "parsing_history.jsonl"
         with history_path.open("a", encoding="utf-8") as history_file:
-            history_file.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
+            history_file.write(json.dumps(slim_record, ensure_ascii=False) + "\n")
 
         logger.info("Parse history saved -> %s", detail_path)
 
@@ -469,46 +497,70 @@ class WindowsResumeProcessor:
             return 0
 
         total = len(pdf_files)
+        jobs = [(pdf_path, f"resume_{idx:04d}") for idx, pdf_path in enumerate(pdf_files, start=1)]
+
+        ## Resumes per LLM batch. A resume sends ~6 prompts (one per work section), and
+        ## prompts from all resumes of a batch are packed into generate() calls of
+        ## batch_size, so a batch must hold enough resumes to fill those calls.
+        files_per_batch = max(1, round(self.batch_size / self._PROMPTS_PER_RESUME))
+
         logger.info("Found %d PDF file(s) in '%s'.", total, directory)
+        logger.info(
+            "LLM batch size: %d prompt(s) per call; %d resume(s) per batch.",
+            self.batch_size, files_per_batch,
+        )
         logger.info("=" * 70)
 
         results: list[dict] = []
         progress = ProgressTracker(total)
 
-        for idx, pdf_path in enumerate(pdf_files, start=1):
-            file_start = time.time()
-            logger.info("[%d/%d] Processing: %s", idx, total, pdf_path.name)
+        ## Stage 1 (PDF text, OCR, layout) runs on a worker thread one batch ahead,
+        ## so reading the next resumes overlaps the LLM work on the current ones.
+        ## One worker keeps OCR/layout single-threaded; the lookahead bounds memory.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="prepare") as pool:
+            futures: list[Future | None] = []
 
-            result = self._process_one(pdf_path, resume_id=f"resume_{idx:04d}")
-            results.append(result)
+            def prefetch(upto: int) -> None:
+                while len(futures) < min(upto, total):
+                    pdf_path, resume_id = jobs[len(futures)]
+                    futures.append(pool.submit(self._prepare, pdf_path, resume_id))
 
-            file_elapsed = time.time() - file_start
-            progress.update(file_elapsed)
+            prefetch(files_per_batch)
+            for start in range(0, total, files_per_batch):
+                batch_start = time.time()
+                end = min(start + files_per_batch, total)
+                prefetch(end + files_per_batch)  # queue the next batch before blocking
+
+                batch = []
+                for i in range(start, end):
+                    pdf_path, resume_id = jobs[i]
+                    logger.info("[%d/%d] Processing: %s", i + 1, total, pdf_path.name)
+                    batch.append((pdf_path, resume_id, futures[i].result()))
+                    futures[i] = None  # drop page images once consumed
+
+                rows = self._run_batch(batch, read_wait=time.time() - batch_start)
+                batch_elapsed = time.time() - batch_start
+                for row in rows:
+                    results.append(row)
+                    progress.update(batch_elapsed / len(rows))
+                ## Rewrite the CSV after every batch, so a crash keeps what was done
+                self._write_csv(results, output_file, quiet=True)
 
         logger.info("=" * 70)
-        self._write_csv(results, output_file)
+        self._write_outputs(results, output_file, save_json)
 
-        if save_json:
-            json_path = output_file.with_suffix(".json")
-            json_path.write_text(
-                json.dumps(results, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            logger.info("JSON saved -> %s", json_path)
-
-        successes = sum(1 for r in results if r.get("extraction_status") == "success")
+        statuses = [r.get("extraction_status") for r in results]
+        successes = sum(1 for status in statuses if status in ("success", "partial"))
+        partial = statuses.count("partial")
         total_time = time.time() - progress.start_time
         avg_per_file = total_time / total if total > 0 else 0
         logger.info(
-            "Finished — %d/%d succeeded.  Total time: %.1fs (avg %.1fs/file).  Results: %s",
-            successes, total, total_time, avg_per_file, output_file,
+            "Finished — %d/%d succeeded (%d partial, see the warnings column).  "
+            "Total time: %.1fs (avg %.1fs/file).  Results: %s",
+            successes, total, partial, total_time, avg_per_file, output_file,
         )
 
-        # Ensure all log output is flushed before returning
-        sys.stdout.flush()
-        for handler in logger.handlers:
-            if hasattr(handler, 'flush'):
-                handler.flush()
+        _flush_logs()
         return successes
 
     # Process a single PDF (Option 2)
@@ -525,18 +577,15 @@ class WindowsResumeProcessor:
         logger.info("Processing: %s", pdf_path.name)
         file_start = time.time()
 
-        result = self._process_one(pdf_path, resume_id="resume_0001")
+        resume_id = "resume_0001"
+        prepared = self._prepare(pdf_path, resume_id)
+        ## All extraction prompts of this resume share one batched LLM call
+        result = self._run_batch(
+            [(pdf_path, resume_id, prepared)], read_wait=time.time() - file_start
+        )[0]
         file_elapsed = time.time() - file_start
 
-        self._write_csv([result], output_file)
-
-        if save_json:
-            json_path = output_file.with_suffix(".json")
-            json_path.write_text(
-                json.dumps([result], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            logger.info("JSON saved -> %s", json_path)
+        self._write_outputs([result], output_file, save_json)
 
         status = result.get("extraction_status")
         logger.info(
@@ -544,27 +593,109 @@ class WindowsResumeProcessor:
             status, file_elapsed, output_file,
         )
 
-        sys.stdout.flush()
-        for handler in logger.handlers:
-            if hasattr(handler, 'flush'):
-                handler.flush()
-        return 1 if status == "success" else 0
+        _flush_logs()
+        return 1 if status in ("success", "partial") else 0
 
-    def _process_one(self, pdf_path: Path, resume_id: str) -> dict:
-        """Run the SmartResume pipeline on a single file; return a flat row dict."""
+    def _prepare(self, pdf_path: Path, resume_id: str) -> tuple[dict, list | None]:
+        """Pipeline stage 1 for one file: (trace, processed_data); see prepare_with_trace."""
+        return self.analyzer.prepare_with_trace(
+            cv_path=str(pdf_path),
+            resume_id=resume_id,
+            extract_types=self.EXTRACT_TYPES,
+        )
+
+    def _run_batch(self, batch: list[tuple[Path, str, tuple]], read_wait: float) -> list[dict]:
+        """
+        Run the LLM and post-processing stages for prepared files; one flat row per file.
+        batch holds (pdf_path, resume_id, (trace, processed_data)) from _prepare.
+        """
+        ready = [item for item in batch if item[2][1] is not None]
+
+        llm_start = time.time()
+        if ready:
+            try:
+                outputs, call_logs = self.analyzer.llm_client.extract_info_batch(
+                    [(resume_id, trace["indexed_text_content"]) for _, resume_id, (trace, _) in ready],
+                    self.EXTRACT_TYPES,
+                    batch_size=self.batch_size,
+                    return_calls=True,
+                )
+                for (pdf_path, _, (trace, processed_data)), structure_output, calls in zip(
+                    ready, outputs, call_logs
+                ):
+                    ## Raw model output per prompt, so a lost section can be traced
+                    trace["llm_calls"] = calls
+                    trace["call_warnings"], trace["incomplete"] = self._warn_on_bad_calls(pdf_path, calls)
+                    self.analyzer.finish_with_trace(trace, processed_data, structure_output)
+            except Exception as exc:
+                logger.error("LLM batch failed: %s", exc, exc_info=True)
+                for pdf_path, resume_id, (trace, _) in ready:
+                    trace["final_result"] = {"error": str(exc)}
+        logger.info(
+            "Stage times: read/OCR wait %.1fs | LLM %.1fs (%d file(s))",
+            read_wait, time.time() - llm_start, len(batch),
+        )
+
+        return [
+            self._build_row(pdf_path, resume_id, trace)
+            for pdf_path, resume_id, (trace, _) in batch
+        ]
+
+    @staticmethod
+    def _warn_on_bad_calls(pdf_path: Path, calls: list[dict]) -> tuple[list[str], bool]:
+        """
+        Log prompts whose output was cut off, failed, or found nothing in a real section.
+
+        Returns (warning messages, incomplete). incomplete is True when some output was
+        cut off or failed, i.e. entries may be missing from the row.
+        """
+        reasons = {
+            "loop": "repeated itself and was stopped",
+            "max_tokens": "hit the token limit",
+        }
+        messages: list[str] = []
+        incomplete = False
+        for call in calls:
+            where = f"{call['extract_type']} [{call['section']}, lines {call['line_range']}]"
+            stop_reason = call.get("stop_reason")
+            if stop_reason in reasons:
+                incomplete = True
+                message = "%s %s; kept %d salvaged entr%s" % (
+                    where, reasons[stop_reason],
+                    call["entries"], "y" if call["entries"] == 1 else "ies",
+                )
+            elif stop_reason == "error":
+                incomplete = True
+                message = f"{where} failed: {call.get('error')}"
+            elif call["entries"] == 0 and call["section"] != "full text":
+                message = f"{where} returned no entries"
+            else:
+                continue
+            logger.warning("%s: %s.", pdf_path.name, message)
+            messages.append(message)
+        return messages, incomplete
+
+    def _write_outputs(self, results: list[dict], output_file: Path, save_json: bool) -> None:
+        self._write_csv(results, output_file)
+
+        if save_json:
+            json_path = output_file.with_suffix(".json")
+            json_path.write_text(
+                json.dumps(results, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info("JSON saved -> %s", json_path)
+
+    def _build_row(self, pdf_path: Path, resume_id: str, trace: dict) -> dict:
+        """Turn a finished pipeline trace into a flat row dict and save parse history."""
         base: dict = {
             "filename": pdf_path.name,
             "extraction_status": "error",
             "error_message": "",
         }
 
-        ## Handles pipeline call, error handling and flattening
+        ## Handles error handling and flattening
         try:
-            trace = self.analyzer.pipeline_with_trace(
-                cv_path=str(pdf_path),
-                resume_id=resume_id,
-                extract_types=self.EXTRACT_TYPES,
-            )
             raw = trace.get("final_result") or {}
 
             if raw.get("error"):
@@ -595,8 +726,13 @@ class WindowsResumeProcessor:
                 return base
 
             flat = flatten_extracted_data(raw)
+            issues = (raw.get("metadata") or {}).get("issues") or []
+            for issue in issues:
+                logger.info("%s: %s", pdf_path.name, issue)
+            warnings = list(trace.get("call_warnings") or []) + list(issues)
             flat["filename"]          = pdf_path.name
-            flat["extraction_status"] = "success"
+            flat["extraction_status"] = "partial" if trace.get("incomplete") else "success"
+            flat["warnings"]          = "; ".join(warnings)
             flat["error_message"]     = ""
             self._write_parse_history(
                 pdf_path=pdf_path,
@@ -615,10 +751,11 @@ class WindowsResumeProcessor:
             return base
 
     @staticmethod
-    def _write_csv(results: list[dict], output_file: Path) -> None:
+    def _write_csv(results: list[dict], output_file: Path, quiet: bool = False) -> None:
         df = pd.DataFrame(results).reindex(columns=csv_columns())
         df.to_csv(output_file, index=False, encoding="utf-8-sig")
-        logger.info("CSV saved -> %s  (%d rows)", output_file, len(df))
+        if not quiet:
+            logger.info("CSV saved -> %s  (%d rows)", output_file, len(df))
 
 def build_parser() -> argparse.ArgumentParser:
     ''' Terminal parser for flag idetnification'''
@@ -626,7 +763,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         prog="process_resumes.py",
-        description="Resume batch processor - Windows / Qwen3-0.6B",
+        description="Resume batch processor - Windows / local LLM (see configs/config.yaml)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -668,6 +805,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=config.processing.page_limit,
                    help="Process only first N pages per resume. Saves time on long CVs. "
                         f"(default: {config.processing.page_limit}, from config.yaml)")
+    p.add_argument("--batch-size", metavar="N", type=int, default=8,
+                   help="LLM prompts per generate call (default: 8). A resume sends ~6 prompts; "
+                        "in directory mode prompts of several resumes share calls. Higher is faster "
+                        "but needs more VRAM; a call that runs out of memory is retried one prompt "
+                        "at a time. 1 = one prompt at a time (slowest, least memory).")
 
     return p
 
@@ -691,6 +833,7 @@ def main() -> None:
             force_ocr=args.force_ocr,
             no_layout_detection=args.no_layout_detection,
             page_limit=args.page_limit,
+            batch_size=args.batch_size,
         ) as processor:
             processor.process_single(
                 pdf_path=file_path,
@@ -712,6 +855,7 @@ def main() -> None:
         force_ocr=args.force_ocr,
         no_layout_detection=args.no_layout_detection,
         page_limit=args.page_limit,
+        batch_size=args.batch_size,
     ) as processor:
         processor.process_directory(
             directory=directory,
@@ -720,5 +864,21 @@ def main() -> None:
         )
 
 
+def run() -> None:
+    """main() with fatal errors written to processing.log instead of vanishing."""
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user. Rows finished so far are in the output CSV.")
+        _flush_logs()
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except BaseException:
+        logger.critical("Run crashed. Rows finished so far are in the output CSV.", exc_info=True)
+        _flush_logs()
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    main()
+    run()

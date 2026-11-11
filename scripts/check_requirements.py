@@ -66,6 +66,7 @@ def check_python_and_gpu() -> None:
 # (import_name, display_name)
 REQUIRED_PACKAGES: list[tuple[str, str]] = [
     ("transformers",                         "Transformers"),
+    ("bitsandbytes",                         "bitsandbytes (NF4)"),
     ("pdfplumber",                           "pdfplumber"),
     ("easyocr",                              "easyocr"),
     ("pandas",                               "pandas"),

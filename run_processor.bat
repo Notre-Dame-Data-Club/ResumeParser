@@ -134,12 +134,12 @@ if "!perf_choice!"=="2" (
     echo [INFO] Fast mode enabled - OCR will be skipped
 )
 if "!perf_choice!"=="3" (
-    set EXTRA_FLAGS=--force-ocr
-    echo [INFO] Better extraction enabled - OCR on all pages
-)
-if "!perf_choice!"=="4" (
     set EXTRA_FLAGS=--no-layout-detection
     echo [INFO] Simpler mode - simple, single page resume optimized
+)
+if "!perf_choice!"=="4" (
+    set EXTRA_FLAGS=--force-ocr
+    echo [INFO] Better extraction enabled - OCR on all pages
 )
 set /p gpu_mem="Enter GPU memory limit in GB (leave blank for auto): "
 set /p page_limit="Limit pages per resume (leave blank for no limit): "
@@ -436,8 +436,11 @@ echo PERFORMANCE TUNING (select during processing):
 echo.
 echo   Mode 1: Default — Balanced speed and quality
 echo   Mode 2: Fast — Skip OCR for text-only PDFs (2-3x faster)
-echo   Mode 3: Better — Force OCR on all pages (quality over speed)
-echo   Mode 4: Lightweight — Skip layout detection (simpler PDFs only)
+echo   Mode 3: Simpler — Skip layout detection (simpler PDFs only)
+echo   Mode 4: Max — Force OCR on all pages (quality over speed)
+echo.
+echo   All modes batch the LLM prompts (--batch-size, default 8; several resumes share calls).
+echo   Use --batch-size 1 if you hit GPU out-of-memory errors.
 echo.
 echo Advanced command-line:
 echo   %PYTHON_CMD% process_resumes.py -d resumes/ --pdf-raw-text --page-limit 5 --gpu-memory 8

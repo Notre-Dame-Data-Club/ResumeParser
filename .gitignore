@@ -9,8 +9,16 @@ dist/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# Downloaded Models
+# Downloaded Models (incl. the Gemma text-only export, models/<name>-text/)
 models/
+# Model weights saved anywhere else
+*.safetensors
+*.safetensors.index.json
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
 
 # Log files
 logs/

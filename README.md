@@ -3,7 +3,7 @@
    <h1>Resume Parser StarterPack </h1>
    <p>Simplified English Version of <i>Alibaba/SmartResume</i><p>
   <h6>Adapted by the Data Club of Notre Dame<h6>
-  <img alt="Qwen" src="https://img.shields.io/badge/Qwen-6950EF?style=flat&logo=qwen&logoColor=white"/> <img alt="YOLO" src="https://img.shields.io/badge/YOLO-111F68?style=flat&logo=yolo&logoColor=white"> <img alt="Transformers" src="https://img.shields.io/badge/transformers-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=white"/> <img alt="Pytorch" src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white"/> <img alt="NVIDIA" src="https://img.shields.io/badge/cuda-000000.svg?style=flat&logo=NVIDIA&logoColor=green"/> 
+  <img alt="Gemma" src="https://img.shields.io/badge/Gemma-4285F4?style=flat&logo=google&logoColor=white"/> <img alt="YOLO" src="https://img.shields.io/badge/YOLO-111F68?style=flat&logo=yolo&logoColor=white"> <img alt="Transformers" src="https://img.shields.io/badge/transformers-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=white"/> <img alt="Pytorch" src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white"/> <img alt="NVIDIA" src="https://img.shields.io/badge/cuda-000000.svg?style=flat&logo=NVIDIA&logoColor=green"/> 
 </div>
 
 
@@ -14,7 +14,7 @@
 Bulk resume scraper and parser, transforming .pdf content into .JSON and .CSV files for easier processing.
 
 **Includes:**
-Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and local Qwen3 field extraction.
+Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and local Gemma 4 E4B (NF4) field extraction.
 
 ### Additions & Changes
 
@@ -97,7 +97,11 @@ In case of error [`configs/config.yaml.example`](/configs/config.yaml.example) s
 | Key | Meaning | Default |
 |-----|---------|---------|
 | `use_direct_models` | Load the model in-process (API connection is included in the original alibaba/SmartResume. It has not been tested here) | `true` |
-| `direct_model_name` | Path to the local LLM | `models/Qwen3-0.6B` |
+| `direct_model_name` | Hugging Face repo id of the LLM, downloaded to `models/<name>` on first use (a local folder path also works) | `google/gemma-4-E4B-it` |
+| `direct_model.quantization` | `nf4` (4-bit, bitsandbytes) or `none` | `nf4` |
+| `direct_model.compute_dtype` | `float16` or `bfloat16` | `float16` |
+| `direct_model.offload_per_layer_embeddings` | Keep Gemma's 5.6 GB per-layer embedding table in RAM (needs ~6 GB free RAM; a one-time text-only export is written to `models/<name>-text/`) | `true` |
+| `direct_model.max_new_tokens` | Output token cap per prompt | `1536` |
 | `layout_detection.enabled` | Use YOLOv10 layout detection | `true` |
 | `ocr.use_cuda` | Run OCR on GPU | `true` |
 | `processing.use_pdf_raw_text` | Skip OCR for text-only PDFs | `false` |
