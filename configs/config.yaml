@@ -36,6 +36,11 @@ processing:
   
   remove_position_and_company_line: false
 
+  # OCR only the pages where it can add text (embedded pictures, text drawn as
+  # outlines, no text layer). On an ordinary text PDF OCR finds nothing and only
+  # costs time. false = OCR every page.
+  skip_ocr_without_images: true
+
 # Layout detection configuration
 layout_detection:
   enabled: true
@@ -47,12 +52,19 @@ direct_model_name: "google/gemma-4-E4B-it"
 
 # Direct model loading / generation
 direct_model:
-  quantization: "nf4"        # nf4 (4-bit, needs bitsandbytes) | none
+  # nf4  = 4-bit weights (bitsandbytes): ~4 GB VRAM, but all weights are unpacked on
+  #        every forward pass, so each generated token is slower.
+  # none = full precision: ~10 GB VRAM, fastest tokens, no quantization loss.
+  # auto = none on GPUs with >= 14 GB VRAM (falls back to nf4 if it does not fit), else nf4.
+  quantization: "nf4"
   compute_dtype: "float16"   # float16 | bfloat16 (try bfloat16 if outputs come back as NaN/garbage)
   # Gemma "E" models carry ~2.8B params of per-layer embedding tables that are only
   # looked up, never multiplied. Keeping them in system RAM saves ~5.6 GB of VRAM.
   offload_per_layer_embeddings: true
   max_new_tokens: 1024
+  # Lower caps for extraction types whose answer is always short
+  max_new_tokens_by_type:
+    basic_info: 256
   # Share of VRAM PyTorch may use. Without a cap Windows spills into shared system
   # memory when VRAM is full and generation crawls. --gpu-memory GB overrides it.
   gpu_memory_fraction: 0.88

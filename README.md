@@ -70,9 +70,73 @@ python process_resumes.py
 | `--no-layout-detection` | Disable YOLO layout detection (faster, simpler PDFs) | NULL |
 | `--page-limit N` | Only process the first N pages per resume | NULL |
 | `--gpu-memory GB` | Cap GPU VRAM usage | NULL |
+| `--quantization MODE` | `nf4` (least VRAM), `none` (fastest) or `auto` — see [Speed and memory](#speed-and-memory) | `nf4` |
+| `--batch-size N` | Most LLM prompts per `generate()` call | `16` |
 | `--save-json` | Also write a full JSON alongside the CSV | NULL |
 | --------------------------------- | --------------------------------- | --------------------------------- |
 
+
+---
+
+### Hugging Face Space (ZeroGPU)
+
+[`app.py`](app.py) is a ready Gradio app for a Space on ZeroGPU hardware. It reads the PDFs on the CPU, holds the GPU only for the LLM step, and returns JSON plus a CSV.
+
+1. Create a Gradio Space, select **ZeroGPU** hardware, and push this repository to it.
+2. Put this block at the very top of the Space's `README.md`:
+
+```yaml
+---
+title: Resume Parser
+sdk: gradio
+app_file: app.py
+---
+```
+
+3. If the model repo is gated for your account, add an `HF_TOKEN` secret in the Space settings.
+
+To use the parser inside an existing Space instead, install this repo there and call it directly:
+
+```python
+import spaces                                  # before anything that imports torch
+from smartresume.service import ResumeParser
+
+parser = ResumeParser()                        # module level: weights are placed on "cuda" here
+
+def read_files(paths):                         # CPU
+    return [parser.read(p, allow_ocr=False) for p in paths]
+
+@spaces.GPU(duration=60)                       # the function Gradio binds
+def extract(documents):
+    return parser.extract(documents)           # [{"filename", "status", "warnings", "data", ...}]
+```
+
+| Variable | Meaning | Default on ZeroGPU |
+| --- | --- | --- |
+| `RESUME_MODEL` | Hugging Face repo id or local folder of the LLM | `google/gemma-4-E4B-it` |
+| `RESUME_QUANTIZATION` | `none`, `nf4` or `auto` | `none` |
+| `RESUME_DTYPE` | `bfloat16` or `float16` | `bfloat16` |
+| `RESUME_BATCH_SIZE` | Most prompts per `generate()` call | `16` |
+| `RESUME_MAX_FILES` | Files accepted per request (`app.py`) | `10` |
+
+> The first start downloads the model and writes the text-only export (several minutes, ~31 GB of disk).
+> To skip the export on later starts, upload `models/gemma-4-E4B-it-text/` to a model repo of your own once
+> and set `RESUME_MODEL` to it.
+
+## Speed and memory
+
+A `generate()` call costs *steps × time per step*: steps is the token count of the longest answer in the call, and the time per step barely changes with the number of rows. Each call logs both (the numbers below only show the format):
+
+```
+generate(): 6 row(s) x 1180 prompt tokens, 412 steps in 9.8s (24 ms/step)
+```
+
+| Setting | Effect |
+| --- | --- |
+| `quantization: nf4` | ~4 GB VRAM. bitsandbytes unpacks every weight on every step, so steps are slower. Use on GPUs under 14 GB. |
+| `quantization: none` | ~10 GB VRAM. Fastest steps and no quantization loss. Use `compute_dtype: bfloat16` on RTX 30-series or newer. |
+| `--batch-size` | More rows per call means fewer calls for a folder of resumes. Calls are sized to the free VRAM automatically. |
+| `processing.skip_ocr_without_images` | OCR runs only on pages that can hold text outside the text layer (pictures, outlined text, scans). |
 
 ## Output Flow
 
@@ -98,13 +162,15 @@ In case of error [`configs/config.yaml.example`](/configs/config.yaml.example) s
 |-----|---------|---------|
 | `use_direct_models` | Load the model in-process (API connection is included in the original alibaba/SmartResume. It has not been tested here) | `true` |
 | `direct_model_name` | Hugging Face repo id of the LLM, downloaded to `models/<name>` on first use (a local folder path also works) | `google/gemma-4-E4B-it` |
-| `direct_model.quantization` | `nf4` (4-bit, bitsandbytes) or `none` | `nf4` |
+| `direct_model.quantization` | `nf4` (4-bit, bitsandbytes), `none` (full precision) or `auto` (`none` on GPUs with 14 GB or more) | `nf4` |
 | `direct_model.compute_dtype` | `float16` or `bfloat16` | `float16` |
 | `direct_model.offload_per_layer_embeddings` | Keep Gemma's 5.6 GB per-layer embedding table in RAM (needs ~6 GB free RAM; a one-time text-only export is written to `models/<name>-text/`) | `true` |
-| `direct_model.max_new_tokens` | Output token cap per prompt | `1536` |
+| `direct_model.max_new_tokens` | Output token cap per prompt | `1024` |
+| `direct_model.max_new_tokens_by_type` | Lower caps for extraction types with short answers | `basic_info: 256` |
 | `layout_detection.enabled` | Use YOLOv10 layout detection | `true` |
 | `ocr.use_cuda` | Run OCR on GPU | `true` |
 | `processing.use_pdf_raw_text` | Skip OCR for text-only PDFs | `false` |
+| `processing.skip_ocr_without_images` | OCR only pages where it can add text; `false` runs OCR on every page | `true` |
 | `processing.use_force_ocr` | Force OCR on every page | `false` |
 
 ## Troubleshooting

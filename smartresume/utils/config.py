@@ -47,6 +47,9 @@ class ProcessingConfig:
 
     remove_position_and_company_line: bool = False
     page_limit: int = 10
+    # Run OCR only on pages where it can add text (embedded pictures, outlined text,
+    # no text layer). False = OCR every page, as before.
+    skip_ocr_without_images: bool = True
 
     def validate(self) -> list[str]:
         """Validate configuration"""
