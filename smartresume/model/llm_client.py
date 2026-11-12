@@ -106,8 +106,12 @@ class _LoopGuard(StoppingCriteria):
         ## Per-row output caps (rows of one call can have different limits)
         self.caps = caps
         self.capped: List[bool] = []
+        ## When the first token arrived (the prompt has been read by then)
+        self.first_token_at: Optional[float] = None
 
     def __call__(self, input_ids, scores, **kwargs):
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
         if not self.looped:
             self.looped = [False] * input_ids.shape[0]
             self.capped = [False] * input_ids.shape[0]
@@ -147,9 +151,14 @@ class _CpuEmbedding(torch.nn.Module if TRANSFORMERS_AVAILABLE else object):
         self.scale = scale
         self.out_dtype = out_dtype
         self.num_embeddings, self.embedding_dim = weight.shape
+        ## Time spent gathering rows in RAM, reported per generate() call
+        self.seconds = 0.0
 
     def forward(self, input_ids):
-        rows = torch.nn.functional.embedding(input_ids.to(self.weight.device), self.weight)
+        cpu_ids = input_ids.to(self.weight.device)  # waits for the GPU; not part of the lookup
+        started = time.perf_counter()
+        rows = torch.nn.functional.embedding(cpu_ids, self.weight)
+        self.seconds += time.perf_counter() - started
         ## Scale on the GPU, in the compute dtype (the table itself stays bf16 in RAM).
         ## The ids say where the model runs; no device index is stored (ZeroGPU hands
         ## each worker its own).
@@ -374,6 +383,7 @@ class LLMClient:
             **DEFAULT_MAX_NEW_TOKENS_BY_TYPE, **(options.get('max_new_tokens_by_type') or {})}
         ## How the model ended up loaded ("nf4" / "none"), for logs and callers
         self.quantization = ""
+        self._cpu_ple: Optional[_CpuEmbedding] = None
         ## Max rows x (prompt + new tokens) per generate() call; 0 = no limit (CPU)
         self.token_budget = 0
         ## Which runtime serves the local model: "ollama" (llama.cpp server, fast on
@@ -641,7 +651,8 @@ class LLMClient:
             parent_name, _, attr = name.rpartition(".")
             parent = self.direct_model.get_submodule(parent_name)
             scale = float(getattr(module, "scalar_embed_scale", 1.0))
-            setattr(parent, attr, _CpuEmbedding(weight, scale, dtype))
+            self._cpu_ple = _CpuEmbedding(weight, scale, dtype)
+            setattr(parent, attr, self._cpu_ple)
             logger.info("Per-layer embeddings in RAM: %s (%.1f GB)", tuple(weight.shape),
                         weight.numel() * weight.element_size() / 1024 ** 3)
             return
@@ -1059,6 +1070,10 @@ class LLMClient:
         max_new_tokens = max(caps)
         device = self.direct_model.get_input_embeddings().weight.device
         guard = _LoopGuard(prompt_width=width, stop_ids=self.stop_ids, digit_ids=self.digit_ids, caps=caps)
+        on_cuda = getattr(device, "type", "") == "cuda"
+        if on_cuda:
+            torch.cuda.reset_peak_memory_stats()
+        ple_before = self._cpu_ple.seconds if self._cpu_ple is not None else 0.0
         started = time.perf_counter()
         with torch.no_grad():
             outputs = self.direct_model.generate(
@@ -1076,10 +1091,24 @@ class LLMClient:
             )
 
         steps = outputs.shape[1] - width
-        elapsed = time.perf_counter() - started
-        ## The numbers to watch when tuning: a call costs steps x ms/step, whatever the row count
-        logger.info("generate(): %d row(s) x %d prompt tokens, %d steps in %.1fs (%.0f ms/step)",
-                    len(id_lists), width, steps, elapsed, 1000 * elapsed / max(steps, 1))
+        finished = time.perf_counter()
+        elapsed = finished - started
+        ## Reading the prompt (up to the first token) and writing the answer are timed
+        ## apart: only the second scales with the answer length
+        prefill = (guard.first_token_at or finished) - started
+        decode = elapsed - prefill
+        detail = ""
+        if self._cpu_ple is not None:
+            detail += "; embedding lookups in RAM %.1fs" % (self._cpu_ple.seconds - ple_before)
+        if on_cuda:
+            free, total = torch.cuda.mem_get_info()
+            ## Free VRAM near zero means the driver may be spilling into system memory
+            detail += "; VRAM peak %.2f GB, free now %.2f of %.1f GB" % (
+                torch.cuda.max_memory_allocated() / 1024 ** 3, free / 1024 ** 3, total / 1024 ** 3)
+        logger.info("generate(): %d row(s) x %d prompt tokens, %d steps in %.1fs "
+                    "(prompt %.1fs, then %.0f ms/step)%s",
+                    len(id_lists), width, steps, elapsed, prefill,
+                    1000 * decode / max(steps - 1, 1), detail)
 
         results = []
         for row, seq in enumerate(outputs):

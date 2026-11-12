@@ -153,7 +153,7 @@ A single resume takes 15–35 s: it only has ~4 prompts to run side by side, and
 A `generate()` call costs *steps × time per step*: steps is the token count of the longest answer in the call, and the time per step barely changes with the number of rows. Each call logs both (the numbers below only show the format):
 
 ```
-generate(): 6 row(s) x 1180 prompt tokens, 412 steps in 9.8s (24 ms/step)
+generate(): 6 row(s) x 1180 prompt tokens, 412 steps in 9.8s (prompt 0.4s, then 23 ms/step); embedding lookups in RAM 0.2s; VRAM peak 4.10 GB, free now 1.20 of 6.0 GB
 ```
 
 | Setting | Effect |

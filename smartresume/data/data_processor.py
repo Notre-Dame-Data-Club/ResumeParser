@@ -26,6 +26,9 @@ _MONTH_YEAR = re.compile(r"\b([A-Za-z]{3,9})\.?,?\s+'?(\d{4})\b")
 _NUMERIC_MONTH_YEAR = re.compile(r"\b(\d{1,2})\s*[/.\-]\s*(\d{4})\b")
 _YEAR_MONTH = re.compile(r"\b(\d{4})\s*[/.\-年]\s*(\d{1,2})\b")
 _YEAR = re.compile(r"\b(19\d{2}|20\d{2}|21\d{2})\b")
+## A whole range written into one date field: "May-June 2026", "2020-2025", "2022 - Present"
+_MONTH_RANGE = re.compile(r"^\s*([A-Za-z]{3,9})\.?\s*(?:-|–|—|to)\s*([A-Za-z]{3,9})\.?,?\s+'?(\d{4})\s*$")
+_YEAR_RANGE = re.compile(r"^\s*((?:19|20|21)\d{2})\s*(?:-|–|—|to)\s*((?:19|20|21)\d{2}|[A-Za-z ]+)\s*$")
 ## Dates later than this many years ahead are loop artefacts ("2040", "2041", ...)
 _MAX_YEARS_AHEAD = 8
 _MIN_YEAR = 1950
@@ -344,9 +347,10 @@ class DataProcessor:
                 processed_exp['employmentPeriod'] = self._process_time_period(exp['employmentPeriod'])
 
             if 'jobDescription_refer_index_range' in exp:
-                processed_exp['jobDescription_refer_index_range'] = exp['jobDescription_refer_index_range']
+                index_range = self._coerce_index_range(exp['jobDescription_refer_index_range'])
+                processed_exp['jobDescription_refer_index_range'] = index_range
                 processed_exp['jobDescription'] = self._extract_description_from_range(
-                    exp['jobDescription_refer_index_range'], text_lines,
+                    index_range, text_lines,
                     processed_exp.get('companyName', ''), processed_exp.get('position', '')
                 )
             elif 'jobDescription' in exp:
@@ -408,7 +412,8 @@ class DataProcessor:
                 for key, value in proj.items()
             }
             if 'description_refer_index_range' in proj:
-                index_range = proj['description_refer_index_range']
+                index_range = self._coerce_index_range(proj['description_refer_index_range'])
+                processed['description_refer_index_range'] = index_range
                 valid = (
                     isinstance(index_range, list) and len(index_range) == 2
                     and all(isinstance(i, int) for i in index_range)
@@ -514,6 +519,37 @@ class DataProcessor:
                 pass
 
         return -1.0
+
+    @staticmethod
+    def _coerce_index_range(index_range: Any) -> Any:
+        """
+        [first, last] from what the model wrote for a line range.
+
+        It sometimes lists every line ([41, 42, 43, 44, 45]) or a single one ([7]);
+        both name a usable range. Anything else is returned unchanged and resolves
+        to an empty description.
+        """
+        if not isinstance(index_range, (list, tuple)) or not index_range:
+            return index_range
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in index_range):
+            return index_range
+        if len(index_range) == 2:
+            return list(index_range)
+        if list(index_range) != sorted(index_range):
+            return index_range
+        return [index_range[0], index_range[-1]]
+
+    @staticmethod
+    def _split_date_range(text: str) -> Optional[Tuple[str, str]]:
+        """("May 2026", "June 2026") for "May-June 2026"; ("2020", "2025") for "2020-2025"."""
+        match = _MONTH_RANGE.match(text)
+        if match and all(_MONTHS.get(m.lower()[:4] if m.lower().startswith("sept") else m.lower()[:3])
+                         for m in match.group(1, 2)):
+            return f"{match.group(1)} {match.group(3)}", f"{match.group(2)} {match.group(3)}"
+        match = _YEAR_RANGE.match(text)
+        if match:
+            return match.group(1), match.group(2).strip()
+        return None
 
     def _extract_description_from_range(self, index_range: List[int], text_lines: List[str], name: str, position: str) -> str:
         """
@@ -647,6 +683,9 @@ class DataProcessor:
                     continue
                 start = str(entry.get('startDate') or '')
                 end = str(entry.get('endDate') or '')
+                ## The same range copied into both fields, or left whole in one of them
+                if start and end in ("", start) and self._split_date_range(start):
+                    start, end = self._split_date_range(start)
                 if start and not end:
                     parts = re.split(r"\s*(?:\s-\s|–|—|\sto\s)\s*", start, maxsplit=1)
                     if len(parts) == 2:
