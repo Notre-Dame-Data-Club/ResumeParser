@@ -76,7 +76,8 @@ _SKIP_WHEN_ABSENT = {"projects"}
 
 _INDEXED_LINE = re.compile(r"^\[(\d+)\]:(.*)$")
 
-## basic_info: lines kept from the top of the resume even when a heading comes earlier
+## basic_info: lines kept from the top of the resume when the lines above the first
+## heading hold no contact data (the heading came too early to trust as the header's end)
 _HEADER_MIN_LINES = 8
 ## Lines outside the header that carry an email, link or phone number (a sidebar or
 ## footer with the contact block); their neighbours come along for the name/location
@@ -189,15 +190,21 @@ def render(lines: Tuple[Tuple[int, str], ...]) -> str:
 def header_lines(lines: List[Tuple[int, str]],
                  sections: List[Section]) -> Optional[Tuple[Tuple[int, str], ...]]:
     """
-    The lines basic_info needs: everything above the first heading (at least the
-    first _HEADER_MIN_LINES lines) plus contact-looking lines elsewhere with their
-    neighbours. None when the headings cannot be trusted or nothing would be saved.
+    The lines basic_info needs: everything above the first heading plus
+    contact-looking lines elsewhere with their neighbours. None when the headings
+    cannot be trusted or nothing would be saved.
+
+    A header that already shows contact data is sent as it is. Padding it with the
+    lines below would hand the model the first section, usually EDUCATION, and it
+    then reports the school's city as the candidate's location.
     """
     if len(sections) < 2 or not lines:
         return None
     first_heading = sections[0].lines[0][0]
     head = sum(1 for index, _ in lines if index < first_heading)
-    keep = set(range(min(len(lines), max(head, _HEADER_MIN_LINES))))
+    if not any(_CONTACT_HINT.search(text) for _, text in lines[:head]):
+        head = max(head, _HEADER_MIN_LINES)
+    keep = set(range(min(len(lines), head)))
     for position, (_, text) in enumerate(lines):
         if position not in keep and _CONTACT_HINT.search(text):
             keep.update(range(max(0, position - _CONTACT_NEIGHBOURS),
