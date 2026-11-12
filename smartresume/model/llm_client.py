@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from openai import OpenAI
@@ -14,6 +15,7 @@ from smartresume.utils.prompts import get_prompts
 from smartresume.utils.schema import EXTRACT_TYPE_SECTIONS, LIST_SECTIONS, SECTION_ENTRY_KEYS
 from smartresume.data.sections import scoped_inputs
 from smartresume.model import text_export
+from smartresume.model.ollama_backend import OllamaBackend, schema_from_template
 
 import random
 import json_repair
@@ -30,6 +32,17 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_NEW_TOKENS = 1024
+## Output caps below max_new_tokens for extraction types whose answer is always short.
+## A row that loops or rambles then stops early instead of holding its whole batch.
+DEFAULT_MAX_NEW_TOKENS_BY_TYPE = {"basic_info": 256}
+## Batches are filled in this order, so rows with answers of similar length share a
+## call (a call runs until its longest answer ends; shorter rows just wait)
+_OUTPUT_LENGTH_ORDER = {"basic_info": 0, "education": 1, "projects": 2, "work_experience": 3}
+## quantization "auto": GPUs with at least this much VRAM load the model unquantized
+_AUTO_FULL_PRECISION_BYTES = 14 * 1024 ** 3
+## generate() budget on ZeroGPU, where VRAM cannot be measured at load time
+## (~10 GB of activations / KV cache at DEFAULT_BYTES_PER_BATCH_TOKEN)
+ZERO_GPU_TOKEN_BUDGET = 60000
 ## Longest prompt (template + resume text) sent to the model; longer resume text is cut
 MAX_PROMPT_TOKENS = 8192
 ## GPU memory one batched token needs during generate() (KV cache, activations,
@@ -37,6 +50,20 @@ MAX_PROMPT_TOKENS = 8192
 DEFAULT_BYTES_PER_BATCH_TOKEN = 160 * 1024
 ## VRAM kept free under the cap for the CUDA context / allocator fragmentation
 _GPU_SAFETY_BYTES = 300 * 1024 ** 2
+
+
+
+def on_zero_gpu() -> bool:
+    """
+    True inside a Hugging Face ZeroGPU Space.
+
+    There, CUDA is emulated while the app starts and a real GPU only exists inside
+    @spaces.GPU calls, in a forked worker. Loading therefore has to place weights
+    with the string device "cuda" (never an index) and must not ask the GPU for its
+    memory.
+    """
+    return os.environ.get("SPACES_ZERO_GPU", "").strip().lower() in ("1", "true")
+
 
 _DTYPES = {"float16": "float16", "fp16": "float16", "half": "float16",
            "bfloat16": "bfloat16", "bf16": "bfloat16", "float32": "float32", "fp32": "float32"}
@@ -68,18 +95,33 @@ class _LoopGuard(StoppingCriteria):
     """
 
     def __init__(self, prompt_width: int, stop_ids: Set[int], digit_ids: Set[int],
-                 check_every: int = 8, window: int = 400) -> None:
+                 check_every: int = 8, window: int = 400,
+                 caps: Optional[List[int]] = None) -> None:
         self.prompt_width = prompt_width
         self.stop_ids = stop_ids
         self.digit_ids = digit_ids
         self.check_every = check_every
         self.window = window
         self.looped: List[bool] = []
+        ## Per-row output caps (rows of one call can have different limits)
+        self.caps = caps
+        self.capped: List[bool] = []
+        ## When the first token arrived (the prompt has been read by then)
+        self.first_token_at: Optional[float] = None
 
     def __call__(self, input_ids, scores, **kwargs):
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
         if not self.looped:
             self.looped = [False] * input_ids.shape[0]
+            self.capped = [False] * input_ids.shape[0]
         generated = input_ids.shape[1] - self.prompt_width
+        if self.caps and generated in self.caps:
+            last = input_ids[:, -1].tolist()
+            for row, cap in enumerate(self.caps):
+                ## A row that already ended is padded with EOS/PAD; it was not cut off
+                if generated == cap and not self.looped[row] and last[row] not in self.stop_ids:
+                    self.capped[row] = True
         if generated >= 30 and generated % self.check_every == 0:
             tails = input_ids[:, -min(generated, self.window):].tolist()
             for row, tail in enumerate(tails):
@@ -89,7 +131,8 @@ class _LoopGuard(StoppingCriteria):
                 masked = [-1 if token in self.digit_ids else token for token in tail]
                 if _find_loop(masked):
                     self.looped[row] = True
-        return torch.tensor(self.looped, dtype=torch.bool, device=input_ids.device)
+        done = [looped or capped for looped, capped in zip(self.looped, self.capped)]
+        return torch.tensor(done, dtype=torch.bool, device=input_ids.device)
 
 
 class _CpuEmbedding(torch.nn.Module if TRANSFORMERS_AVAILABLE else object):
@@ -101,18 +144,25 @@ class _CpuEmbedding(torch.nn.Module if TRANSFORMERS_AVAILABLE else object):
     times embed_scale.
     """
 
-    def __init__(self, weight, scale: float, out_device, out_dtype) -> None:
+    def __init__(self, weight, scale: float, out_dtype) -> None:
         super().__init__()
-        self.register_buffer("weight", weight, persistent=False)
+        ## A plain attribute, not a buffer: model.to("cuda") must leave the table in RAM
+        self.weight = weight
         self.scale = scale
-        self.out_device = out_device
         self.out_dtype = out_dtype
         self.num_embeddings, self.embedding_dim = weight.shape
+        ## Time spent gathering rows in RAM, reported per generate() call
+        self.seconds = 0.0
 
     def forward(self, input_ids):
-        rows = torch.nn.functional.embedding(input_ids.to(self.weight.device), self.weight)
-        ## Scale on the GPU, in the compute dtype (the table itself stays bf16 in RAM)
-        return rows.to(self.out_device).to(self.out_dtype) * self.scale
+        cpu_ids = input_ids.to(self.weight.device)  # waits for the GPU; not part of the lookup
+        started = time.perf_counter()
+        rows = torch.nn.functional.embedding(cpu_ids, self.weight)
+        self.seconds += time.perf_counter() - started
+        ## Scale on the GPU, in the compute dtype (the table itself stays bf16 in RAM).
+        ## The ids say where the model runs; no device index is stored (ZeroGPU hands
+        ## each worker its own).
+        return rows.to(input_ids.device).to(self.out_dtype) * self.scale
 
 
 # -- Response parsing -- #
@@ -327,11 +377,28 @@ class LLMClient:
         self.eos_ids: List[int] = []
         self.pad_id: int = 0
         self.digit_ids: Set[int] = set()
-        self.max_new_tokens = int((getattr(config, 'direct_model', {}) or {}).get(
-            'max_new_tokens', DEFAULT_MAX_NEW_TOKENS))
+        options = getattr(config, 'direct_model', {}) or {}
+        self.max_new_tokens = int(options.get('max_new_tokens', DEFAULT_MAX_NEW_TOKENS))
+        self.max_new_tokens_by_type: Dict[str, int] = {
+            **DEFAULT_MAX_NEW_TOKENS_BY_TYPE, **(options.get('max_new_tokens_by_type') or {})}
+        ## How the model ended up loaded ("nf4" / "none"), for logs and callers
+        self.quantization = ""
+        self._cpu_ple: Optional[_CpuEmbedding] = None
         ## Max rows x (prompt + new tokens) per generate() call; 0 = no limit (CPU)
         self.token_budget = 0
-        self._init_direct_model()
+        ## Which runtime serves the local model: "ollama" (llama.cpp server, fast on
+        ## small GPUs) or "transformers" (in-process; the only one that runs on ZeroGPU)
+        self.backend = str(getattr(config, 'llm_backend', 'transformers') or 'transformers').lower()
+        self.ollama: Optional[OllamaBackend] = None
+        self._schemas: Dict[str, Any] = {}
+        if self.use_direct_models and self.backend == "ollama":
+            self._init_ollama()
+            if self.ollama is None:
+                logger.warning("Ollama is not usable; loading the model with transformers instead "
+                               "(several times slower on a small GPU).")
+        if self.ollama is None:
+            self.backend = "transformers"
+            self._init_direct_model()
 
         self.default_client = None
         self.channel_clients: Dict[str, OpenAI] = {}
@@ -360,6 +427,37 @@ class LLMClient:
                         pass
                 except Exception:
                     pass
+
+    @property
+    def ready(self) -> bool:
+        """True when the local model can take prompts (either backend)."""
+        if self.backend == "ollama":
+            return self.ollama is not None
+        return self.direct_model is not None and self.direct_tokenizer is not None
+
+    @property
+    def model_label(self) -> str:
+        """Model name and runtime, for logs."""
+        if self.backend == "ollama" and self.ollama is not None:
+            return f"{self.ollama.model} via Ollama"
+        return f"{getattr(config, 'direct_model_name', '')} ({self.quantization or 'not loaded'})"
+
+    def _init_ollama(self) -> None:
+        """Connect to (or start) the Ollama server and load the model into it."""
+        from smartresume.utils import prompts as prompt_texts
+        try:
+            backend = OllamaBackend(getattr(config, 'ollama', {}) or {})
+            backend.start()
+        except Exception as e:
+            logger.error("Failed to start the Ollama backend: %s", e)
+            return
+        self.ollama = backend
+        self.quantization = "gguf"
+        ## The answer shape of each extraction type, taken from its prompt TEMPLATE
+        for prompt_key in self.prompts:
+            template = getattr(prompt_texts, f"{prompt_key.upper()}_TEMPLATE", None)
+            if template:
+                self._schemas[prompt_key] = schema_from_template(template)
 
     # -- Direct model loading -- #
     @staticmethod
@@ -405,57 +503,44 @@ class LLMClient:
 
             options = getattr(config, 'direct_model', {}) or {}
             dtype = getattr(torch, _DTYPES.get(str(options.get('compute_dtype', 'float16')).lower(), 'float16'))
-            quantization = str(options.get('quantization', 'nf4')).lower()
             cpu_ple = bool(options.get('offload_per_layer_embeddings', True))
             on_gpu = torch.cuda.is_available()
+            zero_gpu = on_gpu and on_zero_gpu()
 
             ## Gemma "E" models: load a text-only export whose per-layer embeddings stay in RAM
             if on_gpu and cpu_ple and text_export.needs_text_export(local_model_path):
                 local_model_path = text_export.ensure_text_export(local_model_path)
             use_cpu_ple = on_gpu and text_export.has_cpu_ple(local_model_path)
 
-            logger.info("Loading direct model from: %s (%s, %s, %s%s)", local_model_path,
-                        "cuda" if on_gpu else "cpu",
-                        quantization if on_gpu else "no quantization", str(dtype).replace("torch.", ""),
-                        ", per-layer embeddings in RAM" if use_cpu_ple else "")
-
             self.direct_tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
 
-            model_config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
-            ple_rows = None
-            if use_cpu_ple:
-                ## A 1-row placeholder table: the real one is attached on the CPU after loading
-                ple_rows = model_config.vocab_size_per_layer_input
-                model_config.vocab_size_per_layer_input = 1
+            ## "auto" tries full precision first and falls back to NF4 when it does not fit
+            candidates = self._quantization_candidates(options, on_gpu, zero_gpu)
+            for attempt, quantization in enumerate(candidates):
+                logger.info("Loading direct model from: %s (%s, %s, %s%s)", local_model_path,
+                            "zerogpu" if zero_gpu else "cuda" if on_gpu else "cpu",
+                            quantization if on_gpu else "no quantization", str(dtype).replace("torch.", ""),
+                            ", per-layer embeddings in RAM" if use_cpu_ple else "")
+                try:
+                    self._load_direct_model(local_model_path, dtype, quantization, use_cpu_ple, on_gpu, zero_gpu)
+                    self.quantization = quantization if on_gpu else "none"
+                    break
+                except Exception as load_error:
+                    self.direct_model = None
+                    if attempt == len(candidates) - 1:
+                        raise
+                    logger.warning("Loading with quantization=%s failed (%s); trying %s.",
+                                   quantization, load_error, candidates[attempt + 1])
+                    if on_gpu and not zero_gpu:
+                        torch.cuda.empty_cache()
 
-            load_kwargs: Dict[str, Any] = {
-                "config": model_config,
-                "trust_remote_code": True,
-                "dtype": dtype if on_gpu else torch.float32,
-            }
-            if on_gpu:
-                load_kwargs["device_map"] = {"": 0}
-                if quantization == "nf4":
-                    from transformers import BitsAndBytesConfig
-                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=dtype,
-                        bnb_4bit_use_double_quant=True,
-                        llm_int8_skip_modules=["lm_head"],
-                    )
-
-            self.direct_model = AutoModelForCausalLM.from_pretrained(local_model_path, **load_kwargs)
-            if not on_gpu:
-                self.direct_model = self.direct_model.to("cpu")
-            self.direct_model.eval()
-
-            if use_cpu_ple:
-                self._attach_cpu_ple(local_model_path, dtype)
-                self.direct_model.config.vocab_size_per_layer_input = ple_rows
             self._init_token_ids()
 
-            if on_gpu:
+            if zero_gpu:
+                ## No real GPU exists yet: nothing to measure and nothing to cap
+                self.token_budget = int(options.get('token_budget') or ZERO_GPU_TOKEN_BUDGET)
+                logger.info("Direct model placed for ZeroGPU; generate() budget %d batch tokens", self.token_budget)
+            elif on_gpu:
                 self._set_gpu_budget(options)
                 logger.info("Direct model loaded: %.2f GB on GPU", torch.cuda.memory_allocated() / 1024 ** 3)
             else:
@@ -465,6 +550,73 @@ class LLMClient:
             logger.error("Failed to load direct model: %s", e, exc_info=True)
             self.direct_model = None
             self.direct_tokenizer = None
+
+    @staticmethod
+    def _quantization_candidates(options: Dict[str, Any], on_gpu: bool, zero_gpu: bool) -> List[str]:
+        """
+        Quantization modes to try, in order.
+
+        nf4   4-bit weights (bitsandbytes): ~3x less VRAM, but every forward pass
+              first unpacks all weights, so each generated token is slower.
+        none  weights in compute_dtype: more VRAM, fastest tokens, no quantization loss.
+        auto  none where it fits (ZeroGPU, or a GPU with >= 14 GB), else nf4; falls
+              back to nf4 when the full-precision load fails.
+        """
+        quantization = str(options.get('quantization', 'nf4')).lower()
+        if not on_gpu:
+            return ["none"]
+        if quantization != "auto":
+            return [quantization if quantization == "nf4" else "none"]
+        if zero_gpu:
+            return ["none"]
+        total = torch.cuda.get_device_properties(0).total_memory
+        return ["none", "nf4"] if total >= _AUTO_FULL_PRECISION_BYTES else ["nf4"]
+
+    def _load_direct_model(self, model_path: str, dtype, quantization: str,
+                           use_cpu_ple: bool, on_gpu: bool, zero_gpu: bool) -> None:
+        """Load the weights for one quantization mode and put them on the device."""
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        ple_rows = None
+        if use_cpu_ple:
+            ## A 1-row placeholder table: the real one is attached on the CPU after loading
+            ple_rows = model_config.vocab_size_per_layer_input
+            model_config.vocab_size_per_layer_input = 1
+
+        load_kwargs: Dict[str, Any] = {
+            "config": model_config,
+            "trust_remote_code": True,
+            "dtype": dtype if on_gpu else torch.float32,
+        }
+        ## ZeroGPU: the device is the string "cuda". bitsandbytes' loader places the
+        ## weights itself; a full-precision model is loaded in RAM and moved with
+        ## .to("cuda"), the path ZeroGPU intercepts and packs at startup.
+        move_after_load = zero_gpu and quantization != "nf4"
+        if on_gpu and not move_after_load:
+            load_kwargs["device_map"] = "cuda" if zero_gpu else {"": 0}
+        if on_gpu and quantization == "nf4":
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+                llm_int8_skip_modules=["lm_head"],
+            )
+        if move_after_load:
+            load_kwargs["low_cpu_mem_usage"] = True
+
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        if move_after_load:
+            model = model.to("cuda")
+        elif not on_gpu:
+            model = model.to("cpu")
+        model.eval()
+        self.direct_model = model
+
+        if use_cpu_ple:
+            ## After the move, so the table is never sent to the GPU
+            self._attach_cpu_ple(model_path, dtype)
+            model.config.vocab_size_per_layer_input = ple_rows
 
     def _set_gpu_budget(self, options: Dict[str, Any]) -> None:
         """
@@ -482,7 +634,7 @@ class LLMClient:
 
         headroom = fraction * total - torch.cuda.memory_allocated() - _GPU_SAFETY_BYTES
         bytes_per_token = int(options.get('bytes_per_batch_token', DEFAULT_BYTES_PER_BATCH_TOKEN))
-        self.token_budget = max(0, int(headroom // bytes_per_token))
+        self.token_budget = int(options.get('token_budget') or max(0, int(headroom // bytes_per_token)))
         logger.info("GPU cap %.2f GB; generate() budget %d batch tokens (rows x (prompt + %d new))",
                     fraction * total / 1024 ** 3, self.token_budget, self.max_new_tokens)
 
@@ -499,7 +651,8 @@ class LLMClient:
             parent_name, _, attr = name.rpartition(".")
             parent = self.direct_model.get_submodule(parent_name)
             scale = float(getattr(module, "scalar_embed_scale", 1.0))
-            setattr(parent, attr, _CpuEmbedding(weight, scale, torch.device("cuda", 0), dtype))
+            self._cpu_ple = _CpuEmbedding(weight, scale, dtype)
+            setattr(parent, attr, self._cpu_ple)
             logger.info("Per-layer embeddings in RAM: %s (%.1f GB)", tuple(weight.shape),
                         weight.numel() * weight.element_size() / 1024 ** 3)
             return
@@ -714,18 +867,29 @@ class LLMClient:
                         "line_range": scoped["line_range"],
                     }
                     prompts.append(entry)
+                    entry["cap"] = self._output_cap(prompt_key)
+                    if self.backend == "ollama":
+                        entry["text"] = scoped["text"]
+                        continue
                     try:
                         entry["ids"] = self._encode_direct_prompt(prompt_key, scoped["text"])
                     except Exception as e:
                         entry["result"] = self._record_direct_error(resume_id, prompt_key, e)
                         entry.update(stop_reason="error", error=str(e))
 
-        # Prompts of similar length share a batch, so less padding is computed
-        pending = sorted((p for p in prompts if "ids" in p), key=lambda p: len(p["ids"]))
+        if self.backend == "ollama":
+            self._run_ollama_prompts(prompts, jobs)
+
+        # Prompts with answers of similar length, then of similar prompt length, share a
+        # batch: less waiting on one long answer and less padding
+        pending = sorted(
+            (p for p in prompts if "ids" in p),
+            key=lambda p: (_OUTPUT_LENGTH_ORDER.get(p["extract_type"], len(_OUTPUT_LENGTH_ORDER)), len(p["ids"])),
+        )
 
         for chunk in self._plan_batches(pending, batch_size):
             try:
-                outputs = self._generate_direct([p["ids"] for p in chunk])
+                outputs = self._generate_direct([p["ids"] for p in chunk], [p["cap"] for p in chunk])
             except Exception as e:
                 if len(chunk) > 1:
                     logger.warning("Batch of %d prompts failed (%s); retrying one at a time.", len(chunk), e)
@@ -738,7 +902,7 @@ class LLMClient:
                 prompt_key = entry["extract_type"]
                 try:
                     if output is None:  # batch failed: retry this prompt alone
-                        output = self._generate_direct([entry["ids"]])[0]
+                        output = self._generate_direct([entry["ids"]], [entry["cap"]])[0]
                     raw, stop_reason, new_tokens = output
                     entry.update(stop_reason=stop_reason, new_tokens=new_tokens, raw_response=raw)
                     entry["result"] = parse_llm_response(raw, prompt_key, truncated=stop_reason != "eos")
@@ -756,9 +920,60 @@ class LLMClient:
             result = entry.pop("result", {})
             _merge_result(results[entry["job"]], result)
             entry.pop("ids", None)
+            entry.pop("text", None)
+            entry.pop("cap", None)
             entry["entries"] = _count_entries(result, entry["extract_type"])
             calls[entry.pop("job")].append(entry)
         return results, calls
+
+    def _run_ollama_prompts(self, prompts: List[Dict[str, Any]], jobs: List[Tuple[str, str]]) -> None:
+        """
+        Send every prompt to the Ollama server, `parallel` at a time, and store the
+        answers on the prompt entries (same fields as the transformers path).
+
+        Longest answers go first: the call ends when its longest answer does, so
+        that one must not start behind a queue of short ones. Prompts of one
+        extraction type follow each other, so a slot that just served that type
+        still holds its system prompt and only the resume text is read again.
+        """
+        started = time.perf_counter()
+        order = sorted(
+            range(len(prompts)),
+            key=lambda i: (-_OUTPUT_LENGTH_ORDER.get(prompts[i]["extract_type"], 0), -len(prompts[i]["text"])),
+        )
+
+        def looping(pieces: List[str]) -> bool:
+            ## Digits are compared as equal, as in _LoopGuard
+            return _find_loop([-1 if piece.strip().isdigit() else piece for piece in pieces[-400:]])
+
+        def call(entry: Dict[str, Any]) -> Tuple[str, str, int]:
+            prompt_key = entry["extract_type"]
+            system_prompt = self.prompts[prompt_key]
+            text = self.ollama.fit_text(system_prompt, entry["text"], entry["cap"])
+            return self.ollama.chat(system_prompt, text, entry["cap"],
+                                    schema=self._schemas.get(prompt_key), should_stop=looping)
+
+        sent_before, cached_before = self.ollama.prompt_tokens, self.ollama.cached_prompt_tokens
+        outputs = self.ollama.run([lambda entry=prompts[i]: call(entry) for i in order])
+        tokens = 0
+        for i, output in zip(order, outputs):
+            entry = prompts[i]
+            prompt_key = entry["extract_type"]
+            try:
+                if isinstance(output, Exception):
+                    raise output
+                raw, stop_reason, new_tokens = output
+                tokens += new_tokens
+                entry.update(stop_reason=stop_reason, new_tokens=new_tokens, raw_response=raw)
+                entry["result"] = parse_llm_response(raw, prompt_key, truncated=stop_reason != "eos")
+            except Exception as e:
+                entry["result"] = self._record_direct_error(jobs[entry["job"]][0], prompt_key, e)
+                entry.update(stop_reason="error", error=str(e))
+        elapsed = time.perf_counter() - started
+        logger.info("ollama: %d prompt(s), %d new tokens in %.1fs (%.0f tokens/s overall); "
+                    "%d prompt tokens, %d of them cached",
+                    len(prompts), tokens, elapsed, tokens / max(elapsed, 1e-6),
+                    self.ollama.prompt_tokens - sent_before, self.ollama.cached_prompt_tokens - cached_before)
 
     def _plan_batches(self, pending: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
         """
@@ -770,23 +985,32 @@ class LLMClient:
         """
         batches: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
-        for entry in pending:  # ascending length: the newest entry is the widest
+        width = new_tokens = 0  # widest prompt / largest output cap of the open batch
+        for entry in pending:
             rows = len(current) + 1
-            cost = rows * (len(entry["ids"]) + self.max_new_tokens)
+            entry_width = max(width, len(entry["ids"]))
+            entry_new = max(new_tokens, entry["cap"])
+            cost = rows * (entry_width + entry_new)
             if current and (rows > batch_size or (self.token_budget and cost > self.token_budget)):
                 batches.append(current)
                 current = []
+                entry_width, entry_new = len(entry["ids"]), entry["cap"]
             current.append(entry)
+            width, new_tokens = entry_width, entry_new
         if current:
             batches.append(current)
         return batches
 
+    def _output_cap(self, prompt_key: str) -> int:
+        """Most tokens one answer of this extraction type may take."""
+        return max(1, min(self.max_new_tokens, int(self.max_new_tokens_by_type.get(prompt_key, self.max_new_tokens))))
+
     # -- Direct model helpers (shared by the sequential and batched paths) -- #
     def _require_direct_model(self) -> None:
-        if not self.direct_model or not self.direct_tokenizer:
+        if not self.ready:
             raise RuntimeError(
-                "Direct model not loaded and use_direct_models=true — no remote "
-                "fallback is attempted. Check direct_model_name and model files."
+                "Local model not loaded and use_direct_models=true — no remote "
+                "fallback is attempted. Check llm_backend, the model name and the model files."
             )
 
     def _format_prompt(self, system_prompt: str, user_prompt: str) -> str:
@@ -820,9 +1044,13 @@ class LLMClient:
     def _tokenize(self, prompt: str) -> List[int]:
         return self.direct_tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-    def _generate_direct(self, id_lists: List[List[int]]) -> List[Tuple[str, str, int]]:
+    def _generate_direct(self, id_lists: List[List[int]],
+                         caps: Optional[List[int]] = None) -> List[Tuple[str, str, int]]:
         """
         Generate a response for each tokenized prompt in one generate() call (greedy).
+
+        caps holds each row's own output limit (default: max_new_tokens for all); the
+        call runs until every row has ended or reached its limit.
 
         Returns (text, stop_reason, new_tokens) per prompt; stop_reason is "eos" (finished
         normally), "loop" (stopped because it repeated itself) or "max_tokens" (cut off).
@@ -838,13 +1066,20 @@ class LLMClient:
             input_ids[row, width - len(ids):] = torch.tensor(ids, dtype=torch.long)
             attention_mask[row, width - len(ids):] = 1
 
+        caps = list(caps) if caps else [self.max_new_tokens] * len(id_lists)
+        max_new_tokens = max(caps)
         device = self.direct_model.get_input_embeddings().weight.device
-        guard = _LoopGuard(prompt_width=width, stop_ids=self.stop_ids, digit_ids=self.digit_ids)
+        guard = _LoopGuard(prompt_width=width, stop_ids=self.stop_ids, digit_ids=self.digit_ids, caps=caps)
+        on_cuda = getattr(device, "type", "") == "cuda"
+        if on_cuda:
+            torch.cuda.reset_peak_memory_stats()
+        ple_before = self._cpu_ple.seconds if self._cpu_ple is not None else 0.0
+        started = time.perf_counter()
         with torch.no_grad():
             outputs = self.direct_model.generate(
                 input_ids=input_ids.to(device),
                 attention_mask=attention_mask.to(device),
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=max_new_tokens,
                 ## Greedy: the same resume gives the same answer on every run
                 do_sample=False,
                 temperature=None,
@@ -855,19 +1090,40 @@ class LLMClient:
                 stopping_criteria=StoppingCriteriaList([guard]),
             )
 
+        steps = outputs.shape[1] - width
+        finished = time.perf_counter()
+        elapsed = finished - started
+        ## Reading the prompt (up to the first token) and writing the answer are timed
+        ## apart: only the second scales with the answer length
+        prefill = (guard.first_token_at or finished) - started
+        decode = elapsed - prefill
+        detail = ""
+        if self._cpu_ple is not None:
+            detail += "; embedding lookups in RAM %.1fs" % (self._cpu_ple.seconds - ple_before)
+        if on_cuda:
+            free, total = torch.cuda.mem_get_info()
+            ## Free VRAM near zero means the driver may be spilling into system memory
+            detail += "; VRAM peak %.2f GB, free now %.2f of %.1f GB" % (
+                torch.cuda.max_memory_allocated() / 1024 ** 3, free / 1024 ** 3, total / 1024 ** 3)
+        logger.info("generate(): %d row(s) x %d prompt tokens, %d steps in %.1fs "
+                    "(prompt %.1fs, then %.0f ms/step)%s",
+                    len(id_lists), width, steps, elapsed, prefill,
+                    1000 * decode / max(steps - 1, 1), detail)
+
         results = []
         for row, seq in enumerate(outputs):
             new = seq[width:].tolist()
-            end = next((i for i, token in enumerate(new) if token in self.stop_ids), None)
-            ## Rows that stop early are padded, so the loop flag is checked first
+            ## Rows that stop early are padded, so the loop / cap flags are checked first
             if guard.looped and guard.looped[row]:
                 stop_reason = "loop"
-            elif end is not None:
-                stop_reason = "eos"
-            elif len(new) >= self.max_new_tokens:
+            elif guard.capped and guard.capped[row]:
                 stop_reason = "max_tokens"
+                new = new[:caps[row]]
             else:
                 stop_reason = "eos"
+            end = next((i for i, token in enumerate(new) if token in self.stop_ids), None)
+            if stop_reason == "eos" and end is None and len(new) >= max_new_tokens:
+                stop_reason = "max_tokens"
             new_tokens = end if end is not None else len(new)
             results.append((tokenizer.decode(new[:new_tokens], skip_special_tokens=True), stop_reason, new_tokens))
         del outputs

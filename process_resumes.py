@@ -132,6 +132,7 @@ def _load_schema_module():
             "CSV_COLUMNS",
             "LIST_SECTIONS",
             "KIND_LIST_JSON",
+            "flatten_result",
             "validate_csv_schema",
         )
         if not hasattr(schema, name)
@@ -254,66 +255,12 @@ def csv_columns() -> list[str]:
     '''CSV header order, taken from the schema.'''
     return list(_load_schema_module().CSV_COLUMNS)
 
-def _walk_path(entry: dict, path: tuple) -> object:
-    '''Follow nested keys through an extracted entry; "" if any step is missing.'''
-    value: object = entry
-    for key in path:
-        if not isinstance(value, dict):
-            return ""
-        value = value.get(key, "")
-    return "" if value is None else value
-
-
-def _clean_value(value: object) -> object:
-    '''Strip strings; keep lists/numbers as-is so json.dumps preserves types.'''
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (list, tuple)):
-        return [_clean_value(v) for v in value]
-    return value
-
-
-def _scalar_cell(value: object) -> str:
-    '''Scalar cell: plain text. A list (e.g. URLs) becomes a ", " joined string.'''
-    if isinstance(value, (list, tuple)):
-        return ", ".join(str(v).strip() for v in value if str(v).strip())
-    return str(value or "").strip()
-
-
 def flatten_extracted_data(raw: dict) -> dict:
     """
     Flatten pipeline output into a single row. Transforms data to fit 1 resume per row.
-
-    Scalar columns are plain strings. list_json columns are a JSON array with one
-    object per resume entry (see schema.py); written with json.dumps so cells parse.
+    The column rules live next to the schema: smartresume/utils/schema.py flatten_result.
     """
-    schema = _load_schema_module()
-    row: dict[str, str] = {}
-
-    for col in schema.CSV_SCHEMA:
-        ## Columns the caller fills in (filename, extraction_status, ...)
-        if not col.section:
-            row[col.name] = ""
-            continue
-
-        section = raw.get(col.section)
-
-        if col.kind == schema.KIND_LIST_JSON:
-            entries = section if isinstance(section, list) else []
-            cell = [
-                {
-                    spec.out_key: _clean_value(_walk_path(entry, spec.path))
-                    for spec in col.fields
-                }
-                for entry in entries
-                if isinstance(entry, dict)
-            ]
-            row[col.name] = json.dumps(cell, ensure_ascii=False) if cell else ""
-        else:
-            entry = section if isinstance(section, dict) else {}
-            row[col.name] = _scalar_cell(entry.get(col.field, ""))
-
-    return row
+    return _load_schema_module().flatten_result(raw)
 
 # --Terminal Processing/Connection -- #
 
@@ -333,7 +280,9 @@ class WindowsResumeProcessor:
         force_ocr: bool,
         no_layout_detection: bool,
         page_limit: int,
-        batch_size: int = 8,
+        batch_size: int = 16,
+        quantization: str | None = None,
+        backend: str | None = None,
     ) -> None:
         ResumeAnalyzer = _load_analyzer_class()
         self.EXTRACT_TYPES = _load_extract_types()
@@ -348,17 +297,26 @@ class WindowsResumeProcessor:
         self._apply_config_overrides(
             pdf_raw_text, force_ocr, no_layout_detection, page_limit
         )
+        if backend:
+            _load_config().llm_backend = backend
+            logger.info("Config: LLM backend '%s' [this run only]", backend)
+        if quantization:
+            ## Read once, when the model loads below
+            _load_config().direct_model['quantization'] = quantization
+            logger.info("Config: LLM quantization '%s' [this run only]", quantization)
 
         try:
             logger.info("Initialising ResumeAnalyzer (loading model + OCR)…")
             self.analyzer = ResumeAnalyzer()
             llm = self.analyzer.llm_client
-            if llm is not None and llm.use_direct_models and llm.direct_model is None:
+            if llm is not None and llm.use_direct_models and not llm.ready:
                 raise RuntimeError(
-                    "The local LLM failed to load (see the error above). Check direct_model_name "
-                    "in configs/config.yaml and that the model files are downloaded."
+                    "The local LLM failed to load (see the error above). Check llm_backend and the "
+                    "model name in configs/config.yaml, and that the model is downloaded."
                 )
-            logger.info("Analyzer ready.")
+            ## Ollama generates `parallel` prompts at once, whatever --batch-size says
+            self.parallel = llm.ollama.parallel if llm is not None and llm.ollama else 0
+            logger.info("Analyzer ready (%s).", llm.model_label if llm is not None else "no LLM")
         except Exception:
             self._restore_config_overrides()
             raise
@@ -505,10 +463,16 @@ class WindowsResumeProcessor:
         files_per_batch = max(1, round(self.batch_size / self._PROMPTS_PER_RESUME))
 
         logger.info("Found %d PDF file(s) in '%s'.", total, directory)
-        logger.info(
-            "LLM batch size: %d prompt(s) per call; %d resume(s) per batch.",
-            self.batch_size, files_per_batch,
-        )
+        if self.parallel:
+            ## Ollama: a batch only has to keep every slot busy until its last prompts.
+            ## One resume per slot does that (~6 prompts each, longest answers first).
+            files_per_batch = self.parallel
+            logger.info("LLM: %d prompt(s) in parallel; %d resume(s) per batch.", self.parallel, files_per_batch)
+        else:
+            logger.info(
+                "LLM batch size: %d prompt(s) per call; %d resume(s) per batch.",
+                self.batch_size, files_per_batch,
+            )
         logger.info("=" * 70)
 
         results: list[dict] = []
@@ -805,11 +769,21 @@ def build_parser() -> argparse.ArgumentParser:
                    default=config.processing.page_limit,
                    help="Process only first N pages per resume. Saves time on long CVs. "
                         f"(default: {config.processing.page_limit}, from config.yaml)")
-    p.add_argument("--batch-size", metavar="N", type=int, default=8,
-                   help="LLM prompts per generate call (default: 8). A resume sends ~6 prompts; "
-                        "in directory mode prompts of several resumes share calls. Higher is faster "
-                        "but needs more VRAM; a call that runs out of memory is retried one prompt "
+    p.add_argument("--batch-size", metavar="N", type=int, default=16,
+                   help="Most LLM prompts per generate call (default: 16). A resume sends ~6 prompts; "
+                        "in directory mode prompts of several resumes share calls. A call takes about "
+                        "the same time whatever its row count, so higher is faster; calls are also "
+                        "sized to the free VRAM, and one that runs out of memory is retried one prompt "
                         "at a time. 1 = one prompt at a time (slowest, least memory).")
+    p.add_argument("--backend", choices=["ollama", "transformers"], default=None,
+                   help="LLM runtime: ollama (fast on laptop GPUs; needs Ollama installed) or "
+                        "transformers (in-process). --batch-size, --quantization and --gpu-memory "
+                        "only apply to transformers. (default: llm_backend in config.yaml)")
+    p.add_argument("--quantization", choices=["nf4", "none", "auto"],
+                   default=None,
+                   help="How the LLM is loaded: nf4 = 4-bit, least VRAM (~4 GB) but slower tokens; "
+                        "none = full precision, ~10 GB VRAM, fastest; auto = none on GPUs with "
+                        ">= 14 GB, else nf4. (default: direct_model.quantization in config.yaml)")
 
     return p
 
@@ -834,6 +808,8 @@ def main() -> None:
             no_layout_detection=args.no_layout_detection,
             page_limit=args.page_limit,
             batch_size=args.batch_size,
+            quantization=args.quantization,
+            backend=args.backend,
         ) as processor:
             processor.process_single(
                 pdf_path=file_path,
@@ -856,6 +832,8 @@ def main() -> None:
         no_layout_detection=args.no_layout_detection,
         page_limit=args.page_limit,
         batch_size=args.batch_size,
+        quantization=args.quantization,
+        backend=args.backend,
     ) as processor:
         processor.process_directory(
             directory=directory,

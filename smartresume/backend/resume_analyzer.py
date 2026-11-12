@@ -3,6 +3,7 @@ Main analyzer class
 """
 from typing import List, Dict, Any, Optional, Tuple
 from smartresume.data import DataProcessor, FileProcessor
+from smartresume.data.file_processor import OcrRequired
 from smartresume.data.text_extractor import TextExtractor
 from smartresume.model.llm_client import LLMClient
 from smartresume.utils.config import config
@@ -69,9 +70,15 @@ class ResumeAnalyzer:
     def prepare_with_trace(self,
                            cv_path: str,
                            resume_id: str,
-                           extract_types: List[str] = None) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+                           extract_types: List[str] = None,
+                           allow_ocr: bool = True) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
         """
         Pipeline stage 1: read the file (PDF text / OCR / layout) and build the LLM input.
+
+        Args:
+            allow_ocr: False reads only files that need no OCR. For one that does,
+                processed_data is None and trace["needs_ocr"] is True (no error is
+                set); call again with allow_ocr=True where a GPU is available.
 
         Returns:
             (trace, processed_data). On failure processed_data is None and
@@ -87,7 +94,7 @@ class ResumeAnalyzer:
         }
 
         try:
-            processed_data = self.file_processor.process_file(cv_path)
+            processed_data = self.file_processor.process_file(cv_path, allow_ocr=allow_ocr)
             trace["processed_pages"] = self._strip_page_images(processed_data)
 
             text_lines, text_content, indexed_text_content = (
@@ -97,6 +104,9 @@ class ResumeAnalyzer:
             trace["indexed_text_content"] = indexed_text_content
             return trace, processed_data
 
+        except OcrRequired:
+            trace["needs_ocr"] = True
+            return trace, None
         except Exception as e:
             trace["final_result"] = self._error_result(e, resume_id, cv_path)
             return trace, None

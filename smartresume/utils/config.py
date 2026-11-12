@@ -47,6 +47,9 @@ class ProcessingConfig:
 
     remove_position_and_company_line: bool = False
     page_limit: int = 10
+    # Run OCR only on pages where it can add text (embedded pictures, outlined text,
+    # no text layer). False = OCR every page, as before.
+    skip_ocr_without_images: bool = True
 
     def validate(self) -> list[str]:
         """Validate configuration"""
@@ -107,6 +110,11 @@ class Config:
             },
             'auto_download': True
         }
+
+        # Runtime of the local model: "ollama" or "transformers"
+        self.llm_backend = 'transformers'
+        # Ollama settings; missing keys take the defaults in model/ollama_backend.py
+        self.ollama = {}
 
         # Direct (local transformers) model: how to load it
         self.direct_model = {
@@ -247,6 +255,12 @@ class Config:
 
                 if isinstance(yaml_config.get('direct_model'), dict):
                     config.direct_model.update(yaml_config['direct_model'])
+
+                if yaml_config.get('llm_backend'):
+                    config.llm_backend = str(yaml_config['llm_backend']).lower()
+
+                if isinstance(yaml_config.get('ollama'), dict):
+                    config.ollama.update(yaml_config['ollama'])
 
                 # Load model download config
                 if 'model_download' in yaml_config:

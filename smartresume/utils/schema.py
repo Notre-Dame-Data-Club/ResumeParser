@@ -214,6 +214,62 @@ CSV_SCHEMA: Tuple[CsvColumn, ...] = (
 CSV_COLUMNS: Tuple[str, ...] = tuple(col.name for col in CSV_SCHEMA)
 
 
+# -- Row flattening -- #
+def _walk_path(entry: Dict[str, Any], path: Tuple[str, ...]) -> Any:
+    """Follow nested keys through an extracted entry; "" if any step is missing."""
+    value: Any = entry
+    for key in path:
+        if not isinstance(value, dict):
+            return ""
+        value = value.get(key, "")
+    return "" if value is None else value
+
+
+def _clean_value(value: Any) -> Any:
+    """Strip strings; keep lists/numbers as-is so json.dumps preserves types."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return [_clean_value(v) for v in value]
+    return value
+
+
+def _scalar_cell(value: Any) -> str:
+    """Scalar cell: plain text. A list (e.g. URLs) becomes a ", " joined string."""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v).strip() for v in value if str(v).strip())
+    return str(value or "").strip()
+
+
+def flatten_result(raw: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Flatten one pipeline result into a CSV row (one resume per row).
+
+    Scalar columns are plain strings. list_json columns are a JSON array with one
+    object per resume entry (see the module docstring); written with json.dumps so
+    cells parse. Columns the caller fills in (filename, extraction_status, ...) are "".
+    """
+    row: Dict[str, str] = {}
+    for col in CSV_SCHEMA:
+        if not col.section:
+            row[col.name] = ""
+            continue
+
+        section = raw.get(col.section)
+        if col.kind == KIND_LIST_JSON:
+            entries = section if isinstance(section, list) else []
+            cell = [
+                {spec.out_key: _clean_value(_walk_path(entry, spec.path)) for spec in col.fields}
+                for entry in entries
+                if isinstance(entry, dict)
+            ]
+            row[col.name] = json.dumps(cell, ensure_ascii=False) if cell else ""
+        else:
+            entry = section if isinstance(section, dict) else {}
+            row[col.name] = _scalar_cell(entry.get(col.field, ""))
+    return row
+
+
 # -- Validation -- #
 def _section_shape(section: str, raw: str, label: str, problems: List[str]) -> Any:
     """Parse a template/example and return the per-entry object for `section`."""

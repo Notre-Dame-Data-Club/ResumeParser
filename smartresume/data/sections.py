@@ -10,6 +10,11 @@ Lines keep their original [i] indexes, so index ranges in the answers still poin
 into the full text_lines. Whenever the headings cannot be found reliably the full
 text is used, which is the previous behaviour.
 
+basic_info reads only the resume header (the lines above the first heading) plus any
+line elsewhere that looks like contact data, instead of the whole resume: its answer
+is five short fields, and a full-resume prompt made it the widest row of every batch
+(all other rows are padded to it, so it set the memory and prefill cost of the call).
+
 Two cases send nothing instead of the full text:
   * a section that is only its heading line (e.g. "ACTIVITIES/HONORS" directly
     followed by another heading) - with no lines to read, the model copies the
@@ -70,6 +75,20 @@ _ONE_CALL_PER_SECTION = {"work"}
 _SKIP_WHEN_ABSENT = {"projects"}
 
 _INDEXED_LINE = re.compile(r"^\[(\d+)\]:(.*)$")
+
+## basic_info: lines kept from the top of the resume when the lines above the first
+## heading hold no contact data (the heading came too early to trust as the header's end)
+_HEADER_MIN_LINES = 8
+## Lines outside the header that carry an email, link or phone number (a sidebar or
+## footer with the contact block); their neighbours come along for the name/location
+_CONTACT_HINT = re.compile(
+    r"@|https?://|www\.|linkedin|github|\.(?:com|edu|org|io|net|dev|me)\b"
+    r"|\(?\b\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b|\+\d[\d\s().\-]{7,}",
+    re.IGNORECASE,
+)
+_CONTACT_NEIGHBOURS = 2
+## Above this share of the resume the header selection saves nothing: send it all
+_HEADER_MAX_SHARE = 0.7
 
 
 @dataclass(frozen=True)
@@ -168,6 +187,33 @@ def render(lines: Tuple[Tuple[int, str], ...]) -> str:
     return "\n".join(f"[{index}]:{text}" for index, text in lines)
 
 
+def header_lines(lines: List[Tuple[int, str]],
+                 sections: List[Section]) -> Optional[Tuple[Tuple[int, str], ...]]:
+    """
+    The lines basic_info needs: everything above the first heading plus
+    contact-looking lines elsewhere with their neighbours. None when the headings
+    cannot be trusted or nothing would be saved.
+
+    A header that already shows contact data is sent as it is. Padding it with the
+    lines below would hand the model the first section, usually EDUCATION, and it
+    then reports the school's city as the candidate's location.
+    """
+    if len(sections) < 2 or not lines:
+        return None
+    first_heading = sections[0].lines[0][0]
+    head = sum(1 for index, _ in lines if index < first_heading)
+    if not any(_CONTACT_HINT.search(text) for _, text in lines[:head]):
+        head = max(head, _HEADER_MIN_LINES)
+    keep = set(range(min(len(lines), head)))
+    for position, (_, text) in enumerate(lines):
+        if position not in keep and _CONTACT_HINT.search(text):
+            keep.update(range(max(0, position - _CONTACT_NEIGHBOURS),
+                              min(len(lines), position + _CONTACT_NEIGHBOURS + 1)))
+    if len(keep) > _HEADER_MAX_SHARE * len(lines):
+        return None
+    return tuple(lines[position] for position in sorted(keep))
+
+
 def scoped_inputs(indexed_text: str, extract_type: str) -> List[Dict[str, object]]:
     """
     The input(s) to send for one extraction type, each a dict with
@@ -178,10 +224,17 @@ def scoped_inputs(indexed_text: str, extract_type: str) -> List[Dict[str, object
              "line_range": [lines[0][0], lines[-1][0]] if lines else []}]
 
     kind = EXTRACT_TYPE_KINDS.get(extract_type)
-    if kind is None:
+    if kind is None and extract_type != "basic_info":
         return full
 
     sections = split_sections(lines)
+    if kind is None:
+        header = header_lines(lines, sections)
+        if header is None:
+            return full
+        return [{"text": render(header), "section": "header",
+                 "line_range": [header[0][0], header[-1][0]]}]
+
     ## Fewer than 2 headings (e.g. garbled OCR) means the split cannot be trusted
     if len(sections) < 2:
         return full
