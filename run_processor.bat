@@ -43,9 +43,27 @@ for /f "tokens=1,2,3" %%a in ('%PYTHON_CMD% -c "import sys, torch; cuda=torch.cu
     set GPU_STATUS=%%c
 )
 
+REM LLM runtime from configs/config.yaml (llm_backend) and whether Ollama is installed
+set LLM_BACKEND=transformers
+set OLLAMA_FOUND=no
+for /f "tokens=1,2" %%a in ('%PYTHON_CMD% -c "from smartresume.utils.config import config; from smartresume.model.ollama_backend import find_executable; print(config.llm_backend, 'yes' if find_executable() else 'no')" 2^>nul') do (
+    set LLM_BACKEND=%%a
+    set OLLAMA_FOUND=%%b
+)
+
 echo Current System Status:
 echo - Python: %PYTHON_VER% [INSTALLED]
 echo - GPU Device: %GPU_STATUS%
+if /i "!LLM_BACKEND!"=="ollama" (
+    if "!OLLAMA_FOUND!"=="yes" (
+        echo - LLM runtime: Ollama [INSTALLED]
+    ) else (
+        echo - LLM runtime: Ollama NOT FOUND - falling back to slower transformers.
+        echo   Install it from https://ollama.com/download for about 6x faster parsing.
+    )
+) else (
+    echo - LLM runtime: transformers
+)
 echo.
 
 call :log "System status: Python=%PYTHON_VER% GPU=%GPU_STATUS%"
@@ -141,7 +159,9 @@ if "!perf_choice!"=="4" (
     set EXTRA_FLAGS=--force-ocr
     echo [INFO] Better extraction enabled - OCR on all pages
 )
-set /p gpu_mem="Enter GPU memory limit in GB (leave blank for auto): "
+REM The GPU memory cap only applies to the transformers backend
+set "gpu_mem="
+if /i not "!LLM_BACKEND!"=="ollama" set /p gpu_mem="Enter GPU memory limit in GB (leave blank for auto): "
 set /p page_limit="Limit pages per resume (leave blank for no limit): "
 
 REM Final build command
@@ -273,7 +293,9 @@ if "!perf_choice!"=="4" (
     echo [INFO] Better extraction enabled - OCR on all pages
 )
 
-set /p gpu_mem="Enter GPU memory limit in GB (leave blank for auto): "
+REM The GPU memory cap only applies to the transformers backend
+set "gpu_mem="
+if /i not "!LLM_BACKEND!"=="ollama" set /p gpu_mem="Enter GPU memory limit in GB (leave blank for auto): "
 set /p page_limit="Limit pages for this resume (leave blank for no limit): "
 
 REM Final build command
@@ -354,7 +376,11 @@ exit /b !RC!
 REM -- 3. Download Models --
 :download_models
 echo.
-echo Downloading models from Hugging Face...
+if /i "!LLM_BACKEND!"=="ollama" if "!OLLAMA_FOUND!"=="yes" (
+    echo Downloading the LLM into Ollama - about 6 GB the first time.
+) else (
+    echo Downloading the LLM from Hugging Face - about 16 GB.
+)
 echo This may take several minutes depending on internet speed.
 echo.
 
@@ -429,8 +455,13 @@ echo.
 echo Process a single file:
 echo   %PYTHON_CMD% process_resumes.py -f resumes\john_doe.pdf -o result.csv
 echo.
-echo Limit GPU memory:
-echo   %PYTHON_CMD% process_resumes.py -d resumes/ --gpu-memory 8
+echo Choose the LLM runtime for one run:
+echo   %PYTHON_CMD% process_resumes.py -d resumes/ --backend transformers
+echo   Default comes from llm_backend in configs/config.yaml. Ollama is about 6x
+echo   faster on laptop GPUs; without it the parser falls back to transformers.
+echo.
+echo Limit GPU memory - transformers backend only:
+echo   %PYTHON_CMD% process_resumes.py -d resumes/ --backend transformers --gpu-memory 8
 echo.
 echo PERFORMANCE TUNING (select during processing):
 echo.
@@ -439,8 +470,10 @@ echo   Mode 2: Fast — Skip OCR for text-only PDFs (2-3x faster)
 echo   Mode 3: Simpler — Skip layout detection (simpler PDFs only)
 echo   Mode 4: Max — Force OCR on all pages (quality over speed)
 echo.
-echo   All modes batch the LLM prompts (--batch-size, default 8; several resumes share calls).
-echo   Use --batch-size 1 if you hit GPU out-of-memory errors.
+echo   All modes run the LLM prompts of several resumes at once.
+echo   Ollama: 8 prompts in parallel, set by ollama.parallel in configs/config.yaml.
+echo   transformers: --batch-size prompts per call, default 16.
+echo   Use --batch-size 1 with --backend transformers if you hit GPU out-of-memory errors.
 echo.
 echo Advanced command-line:
 echo   %PYTHON_CMD% process_resumes.py -d resumes/ --pdf-raw-text --page-limit 5 --gpu-memory 8
@@ -458,7 +491,8 @@ echo Q: How do I know if my GPU is being used?
 echo A: Run 'nvidia-smi' in another terminal while processing
 echo.
 echo Q: Getting "out of memory" error?
-echo A: Use --gpu-memory option or --page-limit to reduce memory usage
+echo A: Use --page-limit to reduce memory usage. With Ollama lower ollama.parallel
+echo    or ollama.num_ctx in configs/config.yaml. With transformers use --gpu-memory.
 echo.
 echo Q: No results extracted?
 echo A: Check %LOG_FILE%, may need --force-ocr for scanned PDFs

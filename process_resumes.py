@@ -282,6 +282,7 @@ class WindowsResumeProcessor:
         page_limit: int,
         batch_size: int = 16,
         quantization: str | None = None,
+        backend: str | None = None,
     ) -> None:
         ResumeAnalyzer = _load_analyzer_class()
         self.EXTRACT_TYPES = _load_extract_types()
@@ -296,6 +297,9 @@ class WindowsResumeProcessor:
         self._apply_config_overrides(
             pdf_raw_text, force_ocr, no_layout_detection, page_limit
         )
+        if backend:
+            _load_config().llm_backend = backend
+            logger.info("Config: LLM backend '%s' [this run only]", backend)
         if quantization:
             ## Read once, when the model loads below
             _load_config().direct_model['quantization'] = quantization
@@ -305,12 +309,14 @@ class WindowsResumeProcessor:
             logger.info("Initialising ResumeAnalyzer (loading model + OCR)…")
             self.analyzer = ResumeAnalyzer()
             llm = self.analyzer.llm_client
-            if llm is not None and llm.use_direct_models and llm.direct_model is None:
+            if llm is not None and llm.use_direct_models and not llm.ready:
                 raise RuntimeError(
-                    "The local LLM failed to load (see the error above). Check direct_model_name "
-                    "in configs/config.yaml and that the model files are downloaded."
+                    "The local LLM failed to load (see the error above). Check llm_backend and the "
+                    "model name in configs/config.yaml, and that the model is downloaded."
                 )
-            logger.info("Analyzer ready.")
+            ## Ollama generates `parallel` prompts at once, whatever --batch-size says
+            self.parallel = llm.ollama.parallel if llm is not None and llm.ollama else 0
+            logger.info("Analyzer ready (%s).", llm.model_label if llm is not None else "no LLM")
         except Exception:
             self._restore_config_overrides()
             raise
@@ -457,10 +463,16 @@ class WindowsResumeProcessor:
         files_per_batch = max(1, round(self.batch_size / self._PROMPTS_PER_RESUME))
 
         logger.info("Found %d PDF file(s) in '%s'.", total, directory)
-        logger.info(
-            "LLM batch size: %d prompt(s) per call; %d resume(s) per batch.",
-            self.batch_size, files_per_batch,
-        )
+        if self.parallel:
+            ## Ollama: a batch only has to keep every slot busy until its last prompts.
+            ## One resume per slot does that (~6 prompts each, longest answers first).
+            files_per_batch = self.parallel
+            logger.info("LLM: %d prompt(s) in parallel; %d resume(s) per batch.", self.parallel, files_per_batch)
+        else:
+            logger.info(
+                "LLM batch size: %d prompt(s) per call; %d resume(s) per batch.",
+                self.batch_size, files_per_batch,
+            )
         logger.info("=" * 70)
 
         results: list[dict] = []
@@ -763,6 +775,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "the same time whatever its row count, so higher is faster; calls are also "
                         "sized to the free VRAM, and one that runs out of memory is retried one prompt "
                         "at a time. 1 = one prompt at a time (slowest, least memory).")
+    p.add_argument("--backend", choices=["ollama", "transformers"], default=None,
+                   help="LLM runtime: ollama (fast on laptop GPUs; needs Ollama installed) or "
+                        "transformers (in-process). --batch-size, --quantization and --gpu-memory "
+                        "only apply to transformers. (default: llm_backend in config.yaml)")
     p.add_argument("--quantization", choices=["nf4", "none", "auto"],
                    default=None,
                    help="How the LLM is loaded: nf4 = 4-bit, least VRAM (~4 GB) but slower tokens; "
@@ -793,6 +809,7 @@ def main() -> None:
             page_limit=args.page_limit,
             batch_size=args.batch_size,
             quantization=args.quantization,
+            backend=args.backend,
         ) as processor:
             processor.process_single(
                 pdf_path=file_path,
@@ -816,6 +833,7 @@ def main() -> None:
         page_limit=args.page_limit,
         batch_size=args.batch_size,
         quantization=args.quantization,
+        backend=args.backend,
     ) as processor:
         processor.process_directory(
             directory=directory,

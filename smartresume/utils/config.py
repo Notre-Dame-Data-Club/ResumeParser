@@ -111,6 +111,11 @@ class Config:
             'auto_download': True
         }
 
+        # Runtime of the local model: "ollama" or "transformers"
+        self.llm_backend = 'transformers'
+        # Ollama settings; missing keys take the defaults in model/ollama_backend.py
+        self.ollama = {}
+
         # Direct (local transformers) model: how to load it
         self.direct_model = {
             'quantization': 'nf4',
@@ -250,6 +255,12 @@ class Config:
 
                 if isinstance(yaml_config.get('direct_model'), dict):
                     config.direct_model.update(yaml_config['direct_model'])
+
+                if yaml_config.get('llm_backend'):
+                    config.llm_backend = str(yaml_config['llm_backend']).lower()
+
+                if isinstance(yaml_config.get('ollama'), dict):
+                    config.ollama.update(yaml_config['ollama'])
 
                 # Load model download config
                 if 'model_download' in yaml_config:

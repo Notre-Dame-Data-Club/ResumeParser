@@ -15,6 +15,7 @@ from smartresume.utils.prompts import get_prompts
 from smartresume.utils.schema import EXTRACT_TYPE_SECTIONS, LIST_SECTIONS, SECTION_ENTRY_KEYS
 from smartresume.data.sections import scoped_inputs
 from smartresume.model import text_export
+from smartresume.model.ollama_backend import OllamaBackend, schema_from_template
 
 import random
 import json_repair
@@ -375,7 +376,19 @@ class LLMClient:
         self.quantization = ""
         ## Max rows x (prompt + new tokens) per generate() call; 0 = no limit (CPU)
         self.token_budget = 0
-        self._init_direct_model()
+        ## Which runtime serves the local model: "ollama" (llama.cpp server, fast on
+        ## small GPUs) or "transformers" (in-process; the only one that runs on ZeroGPU)
+        self.backend = str(getattr(config, 'llm_backend', 'transformers') or 'transformers').lower()
+        self.ollama: Optional[OllamaBackend] = None
+        self._schemas: Dict[str, Any] = {}
+        if self.use_direct_models and self.backend == "ollama":
+            self._init_ollama()
+            if self.ollama is None:
+                logger.warning("Ollama is not usable; loading the model with transformers instead "
+                               "(several times slower on a small GPU).")
+        if self.ollama is None:
+            self.backend = "transformers"
+            self._init_direct_model()
 
         self.default_client = None
         self.channel_clients: Dict[str, OpenAI] = {}
@@ -404,6 +417,37 @@ class LLMClient:
                         pass
                 except Exception:
                     pass
+
+    @property
+    def ready(self) -> bool:
+        """True when the local model can take prompts (either backend)."""
+        if self.backend == "ollama":
+            return self.ollama is not None
+        return self.direct_model is not None and self.direct_tokenizer is not None
+
+    @property
+    def model_label(self) -> str:
+        """Model name and runtime, for logs."""
+        if self.backend == "ollama" and self.ollama is not None:
+            return f"{self.ollama.model} via Ollama"
+        return f"{getattr(config, 'direct_model_name', '')} ({self.quantization or 'not loaded'})"
+
+    def _init_ollama(self) -> None:
+        """Connect to (or start) the Ollama server and load the model into it."""
+        from smartresume.utils import prompts as prompt_texts
+        try:
+            backend = OllamaBackend(getattr(config, 'ollama', {}) or {})
+            backend.start()
+        except Exception as e:
+            logger.error("Failed to start the Ollama backend: %s", e)
+            return
+        self.ollama = backend
+        self.quantization = "gguf"
+        ## The answer shape of each extraction type, taken from its prompt TEMPLATE
+        for prompt_key in self.prompts:
+            template = getattr(prompt_texts, f"{prompt_key.upper()}_TEMPLATE", None)
+            if template:
+                self._schemas[prompt_key] = schema_from_template(template)
 
     # -- Direct model loading -- #
     @staticmethod
@@ -813,11 +857,17 @@ class LLMClient:
                     }
                     prompts.append(entry)
                     entry["cap"] = self._output_cap(prompt_key)
+                    if self.backend == "ollama":
+                        entry["text"] = scoped["text"]
+                        continue
                     try:
                         entry["ids"] = self._encode_direct_prompt(prompt_key, scoped["text"])
                     except Exception as e:
                         entry["result"] = self._record_direct_error(resume_id, prompt_key, e)
                         entry.update(stop_reason="error", error=str(e))
+
+        if self.backend == "ollama":
+            self._run_ollama_prompts(prompts, jobs)
 
         # Prompts with answers of similar length, then of similar prompt length, share a
         # batch: less waiting on one long answer and less padding
@@ -859,10 +909,60 @@ class LLMClient:
             result = entry.pop("result", {})
             _merge_result(results[entry["job"]], result)
             entry.pop("ids", None)
+            entry.pop("text", None)
             entry.pop("cap", None)
             entry["entries"] = _count_entries(result, entry["extract_type"])
             calls[entry.pop("job")].append(entry)
         return results, calls
+
+    def _run_ollama_prompts(self, prompts: List[Dict[str, Any]], jobs: List[Tuple[str, str]]) -> None:
+        """
+        Send every prompt to the Ollama server, `parallel` at a time, and store the
+        answers on the prompt entries (same fields as the transformers path).
+
+        Longest answers go first: the call ends when its longest answer does, so
+        that one must not start behind a queue of short ones. Prompts of one
+        extraction type follow each other, so a slot that just served that type
+        still holds its system prompt and only the resume text is read again.
+        """
+        started = time.perf_counter()
+        order = sorted(
+            range(len(prompts)),
+            key=lambda i: (-_OUTPUT_LENGTH_ORDER.get(prompts[i]["extract_type"], 0), -len(prompts[i]["text"])),
+        )
+
+        def looping(pieces: List[str]) -> bool:
+            ## Digits are compared as equal, as in _LoopGuard
+            return _find_loop([-1 if piece.strip().isdigit() else piece for piece in pieces[-400:]])
+
+        def call(entry: Dict[str, Any]) -> Tuple[str, str, int]:
+            prompt_key = entry["extract_type"]
+            system_prompt = self.prompts[prompt_key]
+            text = self.ollama.fit_text(system_prompt, entry["text"], entry["cap"])
+            return self.ollama.chat(system_prompt, text, entry["cap"],
+                                    schema=self._schemas.get(prompt_key), should_stop=looping)
+
+        sent_before, cached_before = self.ollama.prompt_tokens, self.ollama.cached_prompt_tokens
+        outputs = self.ollama.run([lambda entry=prompts[i]: call(entry) for i in order])
+        tokens = 0
+        for i, output in zip(order, outputs):
+            entry = prompts[i]
+            prompt_key = entry["extract_type"]
+            try:
+                if isinstance(output, Exception):
+                    raise output
+                raw, stop_reason, new_tokens = output
+                tokens += new_tokens
+                entry.update(stop_reason=stop_reason, new_tokens=new_tokens, raw_response=raw)
+                entry["result"] = parse_llm_response(raw, prompt_key, truncated=stop_reason != "eos")
+            except Exception as e:
+                entry["result"] = self._record_direct_error(jobs[entry["job"]][0], prompt_key, e)
+                entry.update(stop_reason="error", error=str(e))
+        elapsed = time.perf_counter() - started
+        logger.info("ollama: %d prompt(s), %d new tokens in %.1fs (%.0f tokens/s overall); "
+                    "%d prompt tokens, %d of them cached",
+                    len(prompts), tokens, elapsed, tokens / max(elapsed, 1e-6),
+                    self.ollama.prompt_tokens - sent_before, self.ollama.cached_prompt_tokens - cached_before)
 
     def _plan_batches(self, pending: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
         """
@@ -896,10 +996,10 @@ class LLMClient:
 
     # -- Direct model helpers (shared by the sequential and batched paths) -- #
     def _require_direct_model(self) -> None:
-        if not self.direct_model or not self.direct_tokenizer:
+        if not self.ready:
             raise RuntimeError(
-                "Direct model not loaded and use_direct_models=true — no remote "
-                "fallback is attempted. Check direct_model_name and model files."
+                "Local model not loaded and use_direct_models=true — no remote "
+                "fallback is attempted. Check llm_backend, the model name and the model files."
             )
 
     def _format_prompt(self, system_prompt: str, user_prompt: str) -> str:

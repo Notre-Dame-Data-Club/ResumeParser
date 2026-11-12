@@ -90,9 +90,28 @@ def check_packages() -> int:
     return missing
 
 
+def check_ollama() -> None:
+    """Ollama is optional: without it the LLM runs in transformers, several times slower."""
+    _print_section("LLM runtime")
+    try:
+        from smartresume.model.ollama_backend import find_executable
+        from smartresume.utils.config import config
+        backend = getattr(config, "llm_backend", "transformers")
+        executable = find_executable()
+    except Exception as exc:
+        print(f"Could not check: {exc}")
+        return
+    print(f"Configured:        {backend}")
+    print(f"Ollama:            {executable or 'NOT INSTALLED (optional, https://ollama.com/download)'}")
+    if backend == "ollama" and not executable:
+        print("Note: without Ollama the parser falls back to transformers (about 6x slower on a 6 GB GPU)")
+    _file_logger.info("llm_backend=%s, ollama=%s", backend, executable or "not installed")
+
+
 def main() -> int:
     _file_logger.info("--- requirements check started ---")
     check_python_and_gpu()
+    check_ollama()
     missing = check_packages()
 
     print()

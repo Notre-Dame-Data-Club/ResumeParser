@@ -19,6 +19,29 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _pull_with_ollama() -> bool:
+    """
+    With llm_backend: ollama, the LLM is an Ollama model, not a Hugging Face folder.
+    Returns False (after saying why) when Ollama cannot be used, so the caller
+    downloads the transformers model instead.
+    """
+    from smartresume.utils.config import config
+    if getattr(config, "llm_backend", "transformers") != "ollama":
+        return False
+    from smartresume.model import ollama_backend
+    if not ollama_backend.find_executable():
+        print("Ollama is not installed (https://ollama.com/download): it runs the LLM several times "
+              "faster on laptop GPUs.\nDownloading the slower transformers model instead...")
+        return False
+    try:
+        print("Downloading the LLM into Ollama (about 6 GB the first time)...")
+        print(f"Ollama model ready: {ollama_backend.pull_model(getattr(config, 'ollama', {}))}")
+        return True
+    except Exception as e:
+        print(f"Ollama download failed ({e}).\nDownloading the transformers model instead...")
+        return False
+
+
 def download_models(model_type: str = "all", source: str = "huggingface", save_path: str = None):
     """Download models"""
     print(f"Starting to download {model_type} model from {source}")
@@ -33,12 +56,18 @@ def download_models(model_type: str = "all", source: str = "huggingface", save_p
         return False
     
     try:
+        if model_type_enum in (ModelType.ALL, ModelType.LLM) and _pull_with_ollama():
+            if model_type_enum == ModelType.LLM:
+                return True
+            # The LLM is in Ollama; only the layout model is left
+            model_type, model_type_enum = "layout", ModelType.LAYOUT
+
         if model_type_enum == ModelType.ALL:
             # Download all models
             print("Downloading LLM model...")
             llm_path = download_model(ModelType.LLM, model_source_enum, save_path)
             print(f"LLM model downloaded successfully: {llm_path}")
-            
+
             print("Downloading Layout model...")
             layout_path = download_model(ModelType.LAYOUT, model_source_enum, save_path)
             print(f"Layout model downloaded successfully: {layout_path}")

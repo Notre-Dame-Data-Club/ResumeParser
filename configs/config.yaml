@@ -45,6 +45,23 @@ processing:
 layout_detection:
   enabled: true
 
+# Which runtime runs the local LLM:
+#   ollama        Gemma as a 4-bit GGUF served by Ollama (https://ollama.com/download).
+#                 Several times faster on laptop GPUs; needs ~5 GB VRAM and almost no RAM.
+#   transformers  In-process PyTorch (settings under direct_model below). Used by
+#                 app.py on Hugging Face ZeroGPU, and wherever Ollama is not installed.
+llm_backend: "ollama"
+
+ollama:
+  model: "gemma4:e4b-it-qat"   # downloaded on first use (6 GB)
+  # Prompts generated at the same time. More is faster overall until VRAM runs out.
+  parallel: 8
+  # Tokens per prompt + answer. VRAM for contexts grows with parallel x num_ctx.
+  num_ctx: 4096
+  # The parser starts its own Ollama server on this port (the tray app's server on
+  # 11434 only runs one prompt at a time) and stops it when the run ends.
+  host: "http://127.0.0.1:11435"
+
 # Direct model configuration
 use_direct_models: true
 # Hugging Face repo id; downloaded to models/<name> (e.g. models/gemma-4-E4B-it) on first use

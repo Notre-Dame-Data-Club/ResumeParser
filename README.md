@@ -44,6 +44,7 @@ Text Extraction, OCR Computer Vision processing, YOLOv10 layout detection, and l
 
 ### Local Run on Windows
 
+0. Recommended: install [Ollama](https://ollama.com/download). The LLM then runs about 6× faster on laptop GPUs (see [Speed and memory](#speed-and-memory)). Without it the parser falls back to transformers.
 1. Run [`setup.bat`](setup.bat) to install dependancies & models.
 2. Drop your resume PDFs into the [`/resumes`](resumes/) folder.
 3. Run **[`run_processor.bat`](run_processor.bat)** and select decired options when prompted.
@@ -69,9 +70,10 @@ python process_resumes.py
 | `--force-ocr` | Force OCR on all pages (better for scanned PDFs) | NULL |
 | `--no-layout-detection` | Disable YOLO layout detection (faster, simpler PDFs) | NULL |
 | `--page-limit N` | Only process the first N pages per resume | NULL |
-| `--gpu-memory GB` | Cap GPU VRAM usage | NULL |
-| `--quantization MODE` | `nf4` (least VRAM), `none` (fastest) or `auto` — see [Speed and memory](#speed-and-memory) | `nf4` |
-| `--batch-size N` | Most LLM prompts per `generate()` call | `16` |
+| `--backend NAME` | LLM runtime: `ollama` or `transformers` — see [Speed and memory](#speed-and-memory) | `ollama` |
+| `--gpu-memory GB` | Cap GPU VRAM usage (transformers only) | NULL |
+| `--quantization MODE` | `nf4` (least VRAM), `none` (fastest) or `auto` (transformers only) | `nf4` |
+| `--batch-size N` | Most LLM prompts per `generate()` call (transformers only) | `16` |
 | `--save-json` | Also write a full JSON alongside the CSV | NULL |
 | --------------------------------- | --------------------------------- | --------------------------------- |
 
@@ -125,6 +127,29 @@ def extract(documents):
 
 ## Speed and memory
 
+The LLM runs in one of two runtimes, set by `llm_backend` in the config (or `--backend`):
+
+| Backend | What it is | RTX 4050 Laptop (6 GB), folder of resumes |
+| --- | --- | --- |
+| `ollama` | Gemma 4 E4B as a 4-bit GGUF, served by [Ollama](https://ollama.com/download). The parser starts its own Ollama server (port 11435) with 8 parallel slots and stops it when the run ends. ~5 GB VRAM, almost no RAM. | ~10 s per resume |
+| `transformers` | The same model in-process with PyTorch + bitsandbytes. Used on Hugging Face ZeroGPU, and as the fallback when Ollama is not installed. | ~60 s per resume |
+
+With Ollama each run logs its throughput:
+
+```
+ollama: 38 prompt(s), 6932 new tokens in 77.8s (89 tokens/s overall); 32836 prompt tokens, 0 of them cached
+```
+
+| Setting | Effect |
+| --- | --- |
+| `ollama.parallel` | Prompts generated at once. One stream runs at ~39 tokens/s; 8 streams sum to ~170 tokens/s, 12 to ~210. VRAM grows with `parallel × num_ctx`. |
+| `ollama.num_ctx` | Tokens per prompt plus answer. Resume text that does not fit is cut (a warning is logged). |
+| `ollama.model` | Any Gemma tag from the Ollama library, e.g. `gemma4:e2b-it-qat` for a smaller, faster model. |
+
+A single resume takes 15–35 s: it only has ~4 prompts to run side by side, and its time is set by its longest answer.
+
+### transformers backend
+
 A `generate()` call costs *steps × time per step*: steps is the token count of the longest answer in the call, and the time per step barely changes with the number of rows. Each call logs both (the numbers below only show the format):
 
 ```
@@ -160,7 +185,12 @@ In case of error [`configs/config.yaml.example`](/configs/config.yaml.example) s
 
 | Key | Meaning | Default |
 |-----|---------|---------|
-| `use_direct_models` | Load the model in-process (API connection is included in the original alibaba/SmartResume. It has not been tested here) | `true` |
+| `llm_backend` | `ollama` or `transformers` (see [Speed and memory](#speed-and-memory)) | `ollama` |
+| `ollama.model` | Ollama model tag, downloaded on first use | `gemma4:e4b-it-qat` |
+| `ollama.parallel` | Prompts generated at the same time | `8` |
+| `ollama.num_ctx` | Context tokens per prompt (prompt + answer) | `4096` |
+| `ollama.host` | Where the parser starts (or finds) its Ollama server | `http://127.0.0.1:11435` |
+| `use_direct_models` | Run the model locally (API connection is included in the original alibaba/SmartResume. It has not been tested here) | `true` |
 | `direct_model_name` | Hugging Face repo id of the LLM, downloaded to `models/<name>` on first use (a local folder path also works) | `google/gemma-4-E4B-it` |
 | `direct_model.quantization` | `nf4` (4-bit, bitsandbytes), `none` (full precision) or `auto` (`none` on GPUs with 14 GB or more) | `nf4` |
 | `direct_model.compute_dtype` | `float16` or `bfloat16` | `float16` |

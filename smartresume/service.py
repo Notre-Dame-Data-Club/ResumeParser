@@ -21,7 +21,9 @@ and strings, so they survive the pickling between a Space and its GPU worker.
 Settings come from the arguments, then these environment variables, then
 configs/config.yaml:
 
-    RESUME_MODEL           Hugging Face repo id or local folder of the LLM
+    RESUME_BACKEND         ollama | transformers (always transformers on ZeroGPU)
+    RESUME_OLLAMA_MODEL    Ollama model tag (ollama backend)
+    RESUME_MODEL           Hugging Face repo id or local folder of the LLM (transformers backend)
     RESUME_QUANTIZATION    none | nf4 | auto
     RESUME_DTYPE           bfloat16 | float16
     RESUME_MODELS_DIR      where models are downloaded (default: models)
@@ -77,6 +79,10 @@ def configure(model_name: Optional[str] = None,
 
     options = config.direct_model
     zero_gpu = _on_zero_gpu()
+    ## A Space has no Ollama server: ZeroGPU always runs the model in-process
+    backend = "transformers" if zero_gpu else os.environ.get("RESUME_BACKEND")
+    if backend:
+        config.llm_backend = backend.strip().lower()
     quantization = quantization or os.environ.get("RESUME_QUANTIZATION") or ("none" if zero_gpu else None)
     compute_dtype = compute_dtype or os.environ.get("RESUME_DTYPE") or ("bfloat16" if zero_gpu else None)
     max_new_tokens = max_new_tokens or os.environ.get("RESUME_MAX_NEW_TOKENS")
@@ -118,13 +124,12 @@ class ResumeParser:
         started = time.perf_counter()
         self.analyzer = ResumeAnalyzer()
         llm = self.analyzer.llm_client
-        if llm is None or llm.direct_model is None:
+        if llm is None or not llm.ready:
             raise RuntimeError(
-                f"The LLM '{config.direct_model_name}' failed to load (see the log above). "
+                f"The LLM failed to load with llm_backend '{config.llm_backend}' (see the log above). "
                 "Check the model name, the Hugging Face token for gated models, and free disk space."
             )
-        logger.info("ResumeParser ready in %.1fs (model %s, quantization %s)",
-                    time.perf_counter() - started, config.direct_model_name, llm.quantization)
+        logger.info("ResumeParser ready in %.1fs (model %s)", time.perf_counter() - started, llm.model_label)
 
     # -- Stage 1: file -> text (CPU; OCR only when allowed) -- #
     def read(self, path: str, allow_ocr: bool = True, filename: Optional[str] = None) -> Dict[str, Any]:
